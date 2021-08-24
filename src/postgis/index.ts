@@ -23,7 +23,17 @@ export const getGeometryType = (
     });
 };
 
-// TODO: dump multigeometries as single geometries for easier processing: https://postgis.net/docs/ST_Dump.html
+export const toSingleGeomType = (geomType: string): string => {
+  let newGeomType = 'POLYGON';
+  if (geomType === 'POINT' || geomType === 'MULTIPOINT') {
+    newGeomType = 'POINT';
+  } else if (geomType === 'LINESTRING' || geomType === 'MULTILINESTRING') {
+    newGeomType = 'LINESTRING';
+  }
+
+  return newGeomType;
+};
+
 export const cleanGeometries = async (
   client: Client,
   tableName: string
@@ -31,12 +41,7 @@ export const cleanGeometries = async (
   const newTableName = tableName + '_cln';
 
   const geomType = await getGeometryType(client, tableName);
-  let newGeomType = 'POLYGON';
-  if (geomType === 'POINT' || geomType === 'MULTIPOINT') {
-    newGeomType = 'POINT';
-  } else if (geomType === 'LINESTRING' || geomType === 'MULTILINESTRING') {
-    newGeomType = 'LINESTRING';
-  }
+  const newGeomType = toSingleGeomType(geomType);
 
   // TODO: remove
   await client.query(`DROP TABLE IF EXISTS ${newTableName}`);
@@ -76,27 +81,35 @@ export const matchPoints = (
   collection_id?: number
 ): Promise<QueryResult> => {
   return client.query(
-    `SELECT DISTINCT ON (${tableName}.fid, collection_geometries.id)
-      collection_geometries.id as target_id,
-      collection_geometries.collection_id,
-      ${tableName}.fid as source_id
-    FROM collection_geometries
+    `WITH distances AS (SELECT
+      "Geometries".id as target_id,
+      "Geometries".collection_id,
+      ${tableName}.id as source_id,
+      ST_Distance("Geometries".geom, ${tableName}.geom) AS dist
+    FROM "Geometries"
     ${
       open
         ? `
-    JOIN collections ON collection_geometries.collection_id = collections.id
+    JOIN "Collections" ON "Geometries".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
-      (collections.type = 'POINT' OR collections.type = 'MULTIPOINT') AND 
-      ST_DWithin(collection_geometries.geom, ${tableName}.geom, 20)
+      ("Collections".type = 'POINT' OR "Collections".type = 'MULTIPOINT') AND 
+      ST_DWithin("Geometries".geom, ${tableName}.geom, 0.02)
     `
         : `
     CROSS JOIN ${tableName}
         WHERE 
-          collection_geometries.collection_id = $1 AND
-          ST_Distance(collection_geometries.geom, ${tableName}.geom) < 20
+          "Geometries".collection_id = $1 AND
+          ST_Distance("Geometries".geom, ${tableName}.geom) < 0.02
     `
     }
-    ORDER BY ST_Distance(collection_geometries.geom, ${tableName}.geom), ${tableName}.fid`,
+    )
+    SELECT d1.* FROM distances d1
+    JOIN (
+        SELECT source_id, MIN(dist) AS min_dist
+        FROM distances
+        GROUP BY source_id
+    ) d2
+    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist`,
     open ? [] : [collection_id]
   );
 };
@@ -108,40 +121,51 @@ export const matchLines = (
   collection_id?: number
 ): Promise<QueryResult> => {
   return client.query(
-    `SELECT DISTINCT ON(${tableName}.fid, collection_geometries.id)
-      collection_geometries.fid as target_id,
-      collection_geometries.collection_id,
-      ${tableName}.fid as source_id
-    FROM collection_geometries
+    `WITH distances AS (SELECT
+      "Geometries".fid as target_id,
+      "Geometries".collection_id,
+      ${tableName}.id as source_id,
+      ST_HausdorffDistance("Geometries".geom, ${tableName}.geom) AS hausdorff
+    FROM "Geometries"
     ${
       open
         ? `
-    JOIN collections ON collection_geometries.collection_id = collections.id
+    JOIN "Collections" ON "Geometries".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
-      (collections.type = 'LINESTRING' OR collections.type = 'MULTILINESTRING') AND 
-      ST_Contains(ST_Buffer(collection_geometries.geom, 20), ${tableName}.geom)
-    WHERE
-      (ST_Length(collection_geometries.geom) > ST_Length(${tableName}.geom) * 0.9 AND 
-      ST_Length(collection_geometries.geom) < ST_Length(${tableName}.geom) * 1.1)
-      AND
-      (ST_Area(ST_Envelope(collection_geometries.geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND 
-      ST_Area(ST_Envelope(collection_geometries.geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
+      ("Collections".type = 'LINESTRING' OR "Collections".type = 'MULTILINESTRING') AND 
+      ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
     `
         : `
     CROSS JOIN ${tableName}
         WHERE 
-          collection_geometries.collection_id = $1 AND
-          ST_Contains(ST_Buffer(collection_geometries.geom, 20), ${tableName}.geom) AND
-          (ST_Length(collection_geometries.geom) > ST_Length(${tableName}.geom) * 0.9 AND 
-          ST_Length(collection_geometries.geom) < ST_Length(${tableName}.geom) * 1.1)
-          AND
-          (ST_Area(ST_Envelope(collection_geometries.geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND 
-          ST_Area(ST_Envelope(collection_geometries.geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
+          "Geometries".collection_id = $1 AND
+          ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
     `
     }
-    ORDER BY ST_HausdorffDistance(collection_geometries.geom, ${tableName}.geom), ${tableName}.fid`,
+    )
+    SELECT d1.* FROM distances d1
+    JOIN (
+        SELECT source_id, MIN(hausdorff) AS min_hausdorff
+        FROM distances
+        GROUP BY source_id
+    ) d2
+    ON d1.source_id = d2.source_id AND d1.hausdorff = d2.min_hausdorff`,
     open ? [] : [collection_id]
   );
+  /*
+  WHERE
+      (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
+      ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
+      AND
+      (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
+      ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
+   AND
+          (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
+          ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
+          AND
+          (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
+          ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
+  */
 };
 
 export const matchPolygons = (
@@ -151,41 +175,49 @@ export const matchPolygons = (
   collection_id?: number
 ): Promise<QueryResult> => {
   return client.query(
-    `SELECT DISTINCT ON(${tableName}.fid, collection_geometries.id)
-      collection_geometries.id as target_id,
-      collection_geometries.collection_id,
-      ${tableName}.fid as source_id
-    FROM collection_geometries
+    `WITH distances AS (SELECT 
+      "Geometries".id as target_id,
+      "Geometries".collection_id,
+      ${tableName}.id as source_id,
+      ST_HausdorffDistance("Geometries".geom, ${tableName}.geom) AS hausdorff
+    FROM "Geometries"
     ${
       open
         ? `
-    JOIN collections ON collection_geometries.collection_id = collections.id
+    JOIN "Collections" ON "Geometries".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
-      (collections.type = 'POLYGON' OR collections.type = 'MULTIPOLYGON') AND 
-      ST_Contains(ST_Buffer(collection_geometries.geom, 20), ${tableName}.geom)
-    WHERE
-      ST_Area(collection_geometries.geom) > ST_Area(${tableName}.geom) * 0.9 AND 
-      ST_Area(collection_geometries.geom) < ST_Area(${tableName}.geom) * 1.1
+      ("Collections".type = 'POLYGON' OR "Collections".type = 'MULTIPOLYGON') AND 
+      ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
     `
         : `
     CROSS JOIN ${tableName}
       WHERE 
-        collection_geometries.collection_id = $1 AND
-        ST_Contains(ST_Buffer(collection_geometries.geom, 20), ${tableName}.geom) AND
-        ST_Area(collection_geometries.geom) > ST_Area(${tableName}.geom) * 0.9 AND 
-        ST_Area(collection_geometries.geom) < ST_Area(${tableName}.geom) * 1.1
+        "Geometries".collection_id = $1 AND
+        ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
     `
     }
-    ORDER BY ST_HausdorffDistance(collection_geometries.geom, ${tableName}.geom), ${tableName}.fid`,
+    )
+    SELECT d1.* FROM distances d1
+    JOIN (
+        SELECT source_id, MIN(hausdorff) AS min_hausdorff
+        FROM distances
+        GROUP BY source_id
+    ) d2
+    ON d1.source_id = d2.source_id AND d1.hausdorff = d2.min_hausdorff`,
     open ? [] : [collection_id]
   );
+  /*
+   * WHERE
+   *  ST_Area("Geometries".geom) > ST_Area(${tableName}.geom) * 0.9 AND
+   *    ST_Area("Geometries".geom) < ST_Area(${tableName}.geom) * 1.1
+   */
 };
 
 export const matchGeometries = async (
   client: Client,
-  tableName: string,
-  geometryType: GeometryType
+  tableName: string
 ): Promise<null | number> => {
+  const geometryType = await getGeometryType(client, tableName);
   // get number of rows
   const rowCount = await client
     .query(`SELECT COUNT(*) AS rowcount FROM ${tableName}`)
@@ -229,8 +261,17 @@ export const matchGeometries = async (
     }
   });
 
+  console.log(
+    dominantCount,
+    dominantCollection,
+    collectionCount,
+    matches!.rowCount,
+    rowCount
+  );
+
   if (dominantCollection === -1) {
     // TODO: There was no proper match
+    console.log('no proper match 1');
     return null;
   } else if (collectionCount === 1 && matches!.rowCount === rowCount) {
     // if there is only one collection and all elements are matched
@@ -249,17 +290,21 @@ export const matchGeometries = async (
     matches = await matchLines(client, tableName, false, dominantCollection);
   }
 
+  console.log(matches!.rowCount, rowCount);
+
   if (matches!.rowCount === rowCount) {
     return dominantCollection;
   } else {
     const collectionCount = await client.query(
-      'SELECT COUNT(*) AS rowcount FROM collection_geometries WHERE collection_id = $1',
+      'SELECT COUNT(*) AS rowcount FROM "Geometries" WHERE collection_id = $1',
       [dominantCollection]
     );
-    if (matches!.rowCount === collectionCount!.rowCount) {
+    if (matches!.rowCount === collectionCount!.rows[0].rowcount) {
       // TODO: The existing data is a subset of the new data
+      console.log('subset');
     } else {
       // TODO: Looks like there is no match in the database
+      console.log('no proper match 2');
     }
   }
 

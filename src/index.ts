@@ -2,7 +2,7 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import {Client} from 'pg';
 
-import {createCollection, ogr} from './import/index';
+import {createCollection, dropCollection, ogr} from './import/index';
 import {sizeLimit} from './file/index';
 import {
   generateTableName,
@@ -10,7 +10,11 @@ import {
   dropTable,
   getColumns,
 } from './postgres/index';
-import {cleanGeometries, getGeometryType} from './postgis/index';
+import {
+  cleanGeometries,
+  getGeometryType,
+  matchGeometries,
+} from './postgis/index';
 
 // get environmental variables
 dotenv.config({path: path.join(__dirname, '../.env')});
@@ -34,9 +38,9 @@ client.connect().catch((err: Error) => {
 /**
  * @swagger
  *
- * /match:
+ * /importFile:
  *   get:
- *     operationId: getMatch
+ *     operationId: getImportFile
  *     description: match a local spatial data file against exiting spatial taxonomies
  *     produces:
  *       - application/json
@@ -46,7 +50,7 @@ client.connect().catch((err: Error) => {
  *       200:
  *         description: success
  */
-api.get('/match', async (req, res) => {
+api.get('/importFile', async (req, res) => {
   const file =
     '/home/sebastian/Sites/OpenDataCloudServices/local-classification-spatial/test_data/wfs_vg1000-ew/layer_0_vg1000:vg1000_krs.gpkg';
 
@@ -85,19 +89,72 @@ api.get('/match', async (req, res) => {
  *         description: success
  */
 api.get('/import', async (req, res) => {
-  if (!req.query.table || !req.query.name) {
-    res.status(400).json({message: 'Missing parameters (table, name)'});
+  if (!req.query.table || !req.query.name || !req.query.namecolumn) {
+    res
+      .status(400)
+      .json({message: 'Missing parameters (table, name, namecolumn)'});
   } else {
+    await cleanGeometries(client, req.query.table!.toString());
+
     const collectionId = await createCollection(
       client,
       req.query.table!.toString(),
       req.query.name!.toString(),
-      await getGeometryType(client, req.query.table!.toString())
+      req.query.namecolumn!.toString(),
+      req.query.spat ? req.query.spat!.toString() : null
     );
 
-    await cleanGeometries(client, req.query.table!.toString());
-
     res.status(200).json({message: 'importing', collectionId});
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /drop:
+ *   get:
+ *     operationId: getDrop
+ *     description: Drop a collection
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ */
+api.get('/drop/:id', async (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({message: 'Missing id parameter'});
+  } else {
+    await dropCollection(client, parseInt(req.params.id));
+
+    res.status(200).json({message: 'dropped', id: req.params.id});
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /drop:
+ *   get:
+ *     operationId: getDrop
+ *     description: Drop a collection
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ */
+api.get('/match/:table', async (req, res) => {
+  if (!req.params.table) {
+    res.status(400).json({message: 'Missing table parameter'});
+  } else {
+    const match = await matchGeometries(client, req.params.table + '_cln');
+
+    res.status(200).json({message: 'matched', id: req.params.table, match});
   }
 });
 
