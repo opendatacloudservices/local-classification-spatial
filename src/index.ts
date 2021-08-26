@@ -2,7 +2,13 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import {Client} from 'pg';
 
-import {createCollection, dropCollection, ogr} from './import/index';
+import {
+  createCollection,
+  dropCollection,
+  getImportValues,
+  checkValues,
+  ogr,
+} from './import/index';
 import {sizeLimit} from './file/index';
 import {
   generateTableName,
@@ -14,6 +20,7 @@ import {
   cleanGeometries,
   getGeometryType,
   matchGeometries,
+  matchMatrix,
 } from './postgis/index';
 
 // get environmental variables
@@ -136,10 +143,10 @@ api.get('/drop/:id', async (req, res) => {
 /**
  * @swagger
  *
- * /drop:
+ * /match:
  *   get:
- *     operationId: getDrop
- *     description: Drop a collection
+ *     operationId: getMatch
+ *     description: Math import with all collections
  *     produces:
  *       - application/json
  *     responses:
@@ -152,9 +159,27 @@ api.get('/match/:table', async (req, res) => {
   if (!req.params.table) {
     res.status(400).json({message: 'Missing table parameter'});
   } else {
-    const match = await matchGeometries(client, req.params.table + '_cln');
+    const tableName = req.params.table;
+    const match = await matchGeometries(client, tableName + '_cln');
 
-    res.status(200).json({message: 'matched', id: req.params.table, match});
+    let check = false;
+
+    if (match) {
+      const columns = await getColumns(client, tableName);
+      const values = await getImportValues(client, tableName, columns);
+      check = await checkValues(
+        client,
+        values,
+        columns,
+        match,
+        new Date('2021-08-26 14:46:00'),
+        await matchMatrix(client, tableName, match)
+      );
+    }
+
+    res
+      .status(200)
+      .json({message: 'matched', id: req.params.table, match, check});
   }
 });
 

@@ -1,10 +1,6 @@
 import {Client} from 'pg';
 import type {Columns} from '../types';
 
-// TODO: move to env??
-const bigFileTable = 'large_files';
-// const metaTable = 'meta';
-
 export const generateTableName = (filename: string): string => {
   const prefix = 'db_' + Date.now();
   const nameStart = filename.lastIndexOf('/');
@@ -20,7 +16,10 @@ export const generateTableName = (filename: string): string => {
 
 export const saveBigFile = (client: Client, id: number): Promise<void> => {
   return client
-    .query(`INSERT INTO ${bigFileTable} (file_id) VALUES ($1)`, [id])
+    .query('INSERT INTO "Matches" (import_id, message) VALUES ($1, $2)', [
+      id,
+      'big-file',
+    ])
     .then(() => {});
 };
 

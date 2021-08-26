@@ -153,18 +153,18 @@ export const matchLines = (
     open ? [] : [collection_id]
   );
   /*
-  WHERE
+    WHERE
       (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
       ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
       AND
       (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
       ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
-   AND
-          (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
-          ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
-          AND
-          (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
-          ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
+    AND
+      (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
+      ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
+      AND
+      (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
+      ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
   */
 };
 
@@ -216,7 +216,14 @@ export const matchPolygons = (
 export const matchGeometries = async (
   client: Client,
   tableName: string
-): Promise<null | number> => {
+): Promise<{
+  collection_id: number | null;
+  process?: {
+    collections: number[];
+    collectionsCount: number[];
+    message: string;
+  };
+}> => {
   const geometryType = await getGeometryType(client, tableName);
   // get number of rows
   const rowCount = await client
@@ -261,21 +268,22 @@ export const matchGeometries = async (
     }
   });
 
-  console.log(
-    dominantCount,
-    dominantCollection,
-    collectionCount,
-    matches!.rowCount,
-    rowCount
-  );
+  const process = {
+    collections: Object.keys(collections).map(key => parseInt(key)),
+    collectionsCount: Object.keys(collections).map(
+      key => collections[parseInt(key.toString())]
+    ),
+    message: '',
+  };
 
   if (dominantCollection === -1) {
-    // TODO: There was no proper match
-    console.log('no proper match 1');
-    return null;
+    process.message = 'no-match';
+    return {
+      collection_id: null,
+      process,
+    };
   } else if (collectionCount === 1 && matches!.rowCount === rowCount) {
-    // if there is only one collection and all elements are matched
-    return dominantCollection;
+    return {collection_id: dominantCollection};
   }
 
   // check aginst the dominant collection
@@ -290,23 +298,50 @@ export const matchGeometries = async (
     matches = await matchLines(client, tableName, false, dominantCollection);
   }
 
-  console.log(matches!.rowCount, rowCount);
-
   if (matches!.rowCount === rowCount) {
-    return dominantCollection;
+    return {collection_id: dominantCollection};
   } else {
     const collectionCount = await client.query(
       'SELECT COUNT(*) AS rowcount FROM "Geometries" WHERE collection_id = $1',
       [dominantCollection]
     );
     if (matches!.rowCount === collectionCount!.rows[0].rowcount) {
-      // TODO: The existing data is a subset of the new data
-      console.log('subset');
+      process.message = 'subset';
+      process.collections = [dominantCollection];
+      process.collectionsCount = [collectionCount!.rows[0].rowcount];
+      return {
+        collection_id: null,
+        process,
+      };
     } else {
-      // TODO: Looks like there is no match in the database
-      console.log('no proper match 2');
+      process.message = 'no-match-2';
+      return {
+        collection_id: null,
+        process,
+      };
     }
   }
+};
 
-  return null;
+export const matchMatrix = async (
+  client: Client,
+  tableName: string,
+  collection_id: number
+): Promise<[number, number][]> => {
+  const geometryType = await getGeometryType(client, tableName);
+
+  let matches: QueryResult;
+
+  if (geometryType === 'POINT' || geometryType === 'MULTIPOINT') {
+    matches = await matchPoints(client, tableName, false, collection_id);
+  } else if (geometryType === 'POLYGON' || geometryType === 'MULTIPOLYGON') {
+    matches = await matchPolygons(client, tableName, false, collection_id);
+  } else if (
+    geometryType === 'LINESTRING' ||
+    geometryType === 'MULTILINESTRING'
+  ) {
+    matches = await matchLines(client, tableName, false, collection_id);
+  }
+
+  return matches!.rows.map(r => [r.source_id, r.target_id]);
 };

@@ -12,3 +12,5 @@ export type Columns = {
   type: string;
   udt: string;
 }[];
+
+export type Results = {[index: string]: number | string | null}[];

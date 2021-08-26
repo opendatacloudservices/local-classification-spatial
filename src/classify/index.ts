@@ -1,13 +1,21 @@
 import type {Columns} from '../types';
 
-export const identifyNameColumn = (columns: Columns): string | null => {
-  let nameColumn = null;
-  // TODO: identify common name patters extent to regex
-  const names = ['name', 'gen'];
-  columns.forEach(c => {
-    if (names.includes(c.name.toLowerCase())) {
-      nameColumn = c.name;
+const ignoreColumns = [
+  'shape_length',
+  'shape_area',
+  'geom',
+  'fid',
+  'gml_id',
+  'objectid',
+];
+
+export const filterColumns = (columns: Columns): Columns => {
+  return columns.filter(c => {
+    if (ignoreColumns.includes(c.name)) {
+      return false;
+    } else if (c.type.indexOf('timestamp') >= 0) {
+      return false;
     }
+    return true;
   });
-  return nameColumn;
 };
