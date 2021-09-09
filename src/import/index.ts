@@ -1,7 +1,7 @@
 import {exec} from 'child_process';
 import {Client} from 'pg';
 import {toSingleGeomType, getGeometryType, matchMatrix} from '../postgis/index';
-import type {Columns, Results} from '../types';
+import type {Columns, Results, Match} from '../types';
 import {date2timestamp} from '../utils';
 
 export const ogr = (
@@ -43,7 +43,10 @@ export const dropImport = async (
   client: Client,
   tableName: string
 ): Promise<void> => {
-  return client.query(`DROP TABLE ${tableName}`).then(() => {});
+  return client
+    .query(`DROP TABLE IF EXISTS "${tableName}"`)
+    .then(() => client.query(`DROP TABLE IF EXISTS "${tableName}_cln"`))
+    .then(() => {});
 };
 
 // TODO: separate all collection functions into postgres/collection.ts
@@ -55,7 +58,11 @@ export const createCollection = async (
   nameColumn: string,
   spatColumn?: string | null
 ): Promise<number> => {
-  const geomType = toSingleGeomType(await getGeometryType(client, tableName));
+  const geomType = await toSingleGeomType(
+    await getGeometryType(client, tableName),
+    client,
+    tableName
+  );
   const bbox = await client
     .query(`SELECT ST_AsText(ST_Extent(geom)) AS bbox FROM ${tableName}`)
     .then(result => result.rows[0].bbox);
@@ -66,8 +73,10 @@ export const createCollection = async (
     )
     .then(result => result.rows[0].id);
 
+  // TODO: Move other parts into distinct function
+
   await client.query(
-    `INSERT INTO "Geometries" (geom, fid, collection_id) SELECT geom, fid, ${collectionId} FROM ${tableName}_cln`
+    `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${collectionId} FROM ${tableName}_cln`
   );
 
   await client.query(
@@ -92,11 +101,26 @@ export const dropCollection = async (
   client: Client,
   id: number
 ): Promise<void> => {
+  const sources = await client
+    .query('SELECT id FROM "Sources" WHERE collection_id = $1', [id])
+    .then(result => result.rows);
+
+  if (sources && sources.length > 0) {
+    const tables = ['Geometries', 'GeometryProps', 'GeometryAttribues'];
+    await Promise.all(
+      tables.map(t =>
+        client.query(
+          `DELETE FROM "${t}" WHERE source_id IN (${sources.join(',')})`
+        )
+      )
+    );
+    await client.query(
+      `DELETE FROM "Sources" WHERE id IN (${sources.join(',')})`
+    );
+  }
+
   return client
     .query('DELETE FROM "Collections" WHERE id = $1', [id])
-    .then(() =>
-      client.query('DELETE FROM "Geometries" WHERE collection_id = $1', [id])
-    )
     .then(() => {});
 };
 
@@ -136,7 +160,7 @@ export const checkValues = async (
   client: Client,
   values: Results,
   columns: Columns,
-  collection_id: number,
+  source_id: number,
   updated: Date,
   matrix: [number, number][]
 ): Promise<boolean> => {
@@ -147,8 +171,8 @@ export const checkValues = async (
   // check if timestamp already exists in the database
   const exists = await client
     .query(
-      'SELECT * FROM "GeometryAttributes" WHERE collection_id = $1 AND updated = TO_TIMESTAMP($2, \'YYYY-MM-DD HH:MI:SS\') LIMIT 1',
-      [collection_id, date2timestamp(updated)]
+      'SELECT * FROM "GeometryAttributes" WHERE source_id = $1 AND updated = TO_TIMESTAMP($2, \'YYYY-MM-DD HH:MI:SS\') LIMIT 1',
+      [source_id, date2timestamp(updated)]
     )
     .then(result => result.rows.length >= 1);
 
@@ -161,8 +185,8 @@ export const checkValues = async (
     // get the closest timestamp before and after the new timestamp
     await client
       .query(
-        'SELECT DISTINCT ON (updated) updated FROM "GeometryAttributes" WHERE collection_id = $1 ORDER BY updated ASC',
-        [collection_id]
+        'SELECT DISTINCT ON (updated) updated FROM "GeometryAttributes" WHERE source_id = $1 ORDER BY updated ASC',
+        [source_id]
       )
       .then(result => {
         let before = -Number.MAX_VALUE;
@@ -197,7 +221,7 @@ export const checkValues = async (
       columns,
       values,
       updated,
-      collection_id
+      source_id
     );
     if (change) {
       hasNewData = true;
@@ -213,15 +237,15 @@ export const checkAgainstTimestamp = async (
   columns: Columns,
   values: Results,
   timestamp: Date,
-  collection_id: number
+  source_id: number
 ): Promise<boolean> => {
   let hasChanged = false;
 
   for (let ci = 0; ci < columns.length; ci += 1) {
     const currentValues = await client
       .query(
-        'SELECT * FROM "GeometryAttributes" WHERE key = $1 update = $2 AND collection_id = $3',
-        [columns[ci].name, timestamp, collection_id]
+        'SELECT * FROM "GeometryAttributes" WHERE key = $1 update = $2 AND source_id = $3',
+        [columns[ci].name, timestamp, source_id]
       )
       .then(r => r.rows);
 
@@ -410,13 +434,14 @@ export const createSource = async (
   client: Client,
   odcsClient: Client,
   updated: Date,
-  import_id: number | null
+  import_id: number | null,
+  collection_id: number
 ): Promise<number> => {
   if (!import_id) {
     return client
       .query(
-        'INSERT INTO "Sources" (updated, manual) VALUES ($1, $2) RETURN id',
-        [updated, true]
+        'INSERT INTO "Sources" (updated, manual, collection_id) VALUES ($1, $2, $3) RETURN id',
+        [updated, true, collection_id]
       )
       .then(r => r.rows[0].id);
   }
@@ -427,8 +452,8 @@ export const createSource = async (
 
   return client
     .query(
-      'INSERT INTO "Sources" (import_id, updated, manual, copyright) VALUES ($1, $2, $3, $4) RETURN id',
-      [import_id, updated, false, importData.meta_license]
+      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id) VALUES ($1, $2, $3, $4, $5) RETURN id',
+      [import_id, updated, false, importData.meta_license, collection_id]
     )
     .then(r => r.rows[0].id);
 };
@@ -439,9 +464,9 @@ export const importValues = async (
   values: Results,
   columns: Columns,
   updated: Date,
-  collection_id: number
+  source_id: number
 ): Promise<void> => {
-  const matrix = await matchMatrix(client, tableName, collection_id);
+  const matrix = await matchMatrix(client, tableName, source_id);
   const valuesMatrixMap = matrixToValuesMatrix(matrix, values);
   for (let c = 0; c < columns.length; c += 1) {
     const inserts: (number | string | null | number[] | string[] | Date)[] = [];
@@ -461,7 +486,7 @@ export const importValues = async (
       inserts.push(
         updated,
         valuesMatrixMap[parseInt(v.fid!.toString())],
-        collection_id,
+        source_id,
         columns[c].name,
         v[columns[c].name]
       );
@@ -498,7 +523,7 @@ export const importValues = async (
       (
         updated,
         fid,
-        collection_id,
+        source_id,
         key,
         ${targetType}
       )
@@ -507,4 +532,33 @@ export const importValues = async (
       inserts
     );
   }
+};
+
+export const saveMatch = (
+  client: Client,
+  import_id: number,
+  file: string,
+  match: Match,
+  message: string,
+  tableName: string,
+  difference?: {
+    source_id: number;
+    target_id: number;
+    dist: number;
+  }[]
+): Promise<number> => {
+  return client
+    .query(
+      'INSERT INTO "Matches" (import_id, file, matches, message, matches_count, table_name, difference) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+      [
+        import_id,
+        file,
+        match.process?.sources,
+        message,
+        match.process?.sourceCount,
+        tableName,
+        difference ? JSON.stringify(difference) : null,
+      ]
+    )
+    .then(result => result.rows[0].id);
 };

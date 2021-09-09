@@ -4,7 +4,7 @@
     "rootDir": "./src",
     "outDir": "build",
     "resolveJsonModule": true,
-    "lib": ["es2021"]
+    "lib": ["es2021","DOM"]
   },
   "include": [
     "src/**/*.ts",

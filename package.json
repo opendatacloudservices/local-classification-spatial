@@ -36,6 +36,8 @@
   "homepage": "https://github.com/opendatacloudservices/local-classification-spatial#readme",
   "devDependencies": {
     "@types/node": "^14.11.2",
+    "@types/node-fetch": "^2.5.12",
+    "@types/node-notifier": "^8.0.1",
     "@types/pg": "^8.6.1",
     "eslint": "^7.32.0",
     "gts": "^3.1.0",
@@ -46,9 +48,11 @@
   "dependencies": {
     "dotenv": "^10.0.0",
     "fast-xml-parser": "^3.19.0",
+    "jszip": "^3.7.1",
     "local-logger": "file:../local-logger",
     "local-microservice": "file:../local-microservice",
     "node-fetch": "^2.6.1",
+    "node-notifier": "^10.0.0",
     "pg": "^8.7.1"
   }
 }
