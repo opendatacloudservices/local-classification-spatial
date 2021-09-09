@@ -4,7 +4,6 @@
  */
 
 import {Client} from 'pg';
-import type {GeoJson, GeoJsonFeature} from '../types';
 import {getGeometryType, getGeomSummary} from '../postgis';
 import {geojson, getMatch} from '../postgres/matches';
 import {downloadCompletion, setClassified} from '../postgres';
@@ -139,11 +138,11 @@ export const handleXplan = async (
     geom.bbox
   );
 
-  downloadCompletion(odcsClient, download_id);
+  await downloadCompletion(odcsClient, download_id);
 
-  const geojsonObj = geojson(client, match.id);
+  const geojsonObj = await geojson(client, match.id);
 
-  saveZip(
+  await saveZip(
     JSON.stringify(geojsonObj),
     match.import_id + '.geojson',
     (process.env.PLANNING_LOCATION || '') + match.import_id + '.zip'

@@ -69,7 +69,7 @@ export const setClassified = (
   xplan = false,
   centroid: null | string = null,
   bbox: null | string = null,
-  thematic: null | string = null
+  thematic: null | number = null
 ): Promise<number> => {
   const params = [];
 

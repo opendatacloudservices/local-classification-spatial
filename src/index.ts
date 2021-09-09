@@ -468,8 +468,8 @@ api.get('/matches/setthematic/:id', async (req, res) => {
     });
   } else {
     handleThematic(
-      client,
       odcs_client,
+      client,
       parseInt(req.params.id),
       req.query.thematic.toString()
     ).then(() => {
