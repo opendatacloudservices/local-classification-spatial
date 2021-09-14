@@ -5,8 +5,6 @@ import * as notifier from 'node-notifier';
 import fetch from 'node-fetch';
 
 import {
-  createCollection,
-  dropCollection,
   getImportValues,
   checkValues,
   ogr,
@@ -14,6 +12,7 @@ import {
   importValues,
   saveMatch,
   dropImport,
+  importMatch,
 } from './import/index';
 import {sizeLimit} from './file/index';
 import {
@@ -38,6 +37,11 @@ import {
   details as matchesDetails,
   geojsonClean as matchesGeojsonClean,
 } from './postgres/matches';
+import {
+  list as collectionsList,
+  create as collectionCreate,
+  dropCollection,
+} from './postgres/collections';
 
 // get environmental variables
 dotenv.config({path: path.join(__dirname, '../.env')});
@@ -164,7 +168,9 @@ api.get('/next', async (req, res) => {
                     odcs_client,
                     next.downloaded,
                     next.id,
-                    collection_id
+                    collection_id,
+                    JSON.stringify(match.process) || null,
+                    match.source_id
                   );
 
                   const columns = await getColumns(client, tableName);
@@ -297,24 +303,61 @@ api.get('/start', async (req, res) => {
  *       200:
  *         description: success
  */
-api.get('/import', async (req, res) => {
-  if (!req.query.table || !req.query.name || !req.query.namecolumn) {
+api.get('/import/new', async (req, res) => {
+  if (!req.query.id || !req.query.name || !req.query.nameColumn) {
     res
       .status(400)
       .json({message: 'Missing parameters (table, name, namecolumn)'});
   } else {
-    const collectionId = await createCollection(
+    const collectionId = await importMatch(
       client,
-      req.query.table!.toString(),
-      req.query.name!.toString(),
-      req.query.namecolumn!.toString(),
-      req.query.spat ? req.query.spat!.toString() : null
+      odcs_client,
+      parseInt(req.query.id.toString()),
+      req.query.name.toString(),
+      req.query.nameColumn.toString()
+      // TODO: spatColumn, geomOnly, collectionId, method, previous
     );
-
-    // TODO: also import the values
 
     res.status(200).json({message: 'importing', collectionId});
   }
+});
+
+/**
+ * @swagger
+ *
+ * /import/merge:
+ *   get:
+ *     operationId: getImportMerge
+ *     description: Import a new spatial topology as a new collection
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ */
+api.get('/import/merge', async (req, res) => {
+  // merge
+});
+
+/**
+ * @swagger
+ *
+ * /import/update:
+ *   get:
+ *     operationId: getImportUpdate
+ *     description: Import a new spatial topology as a new collection
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ */
+api.get('/import/merge', async (req, res) => {
+  // merge
 });
 
 /**
@@ -362,6 +405,27 @@ api.get('/drop/:id', async (req, res) => {
  */
 api.get('/matches/list', async (req, res) => {
   matchesList(client).then(result => {
+    res.status(200).json(result);
+  });
+});
+
+/**
+ * @swagger
+ *
+ * /collections/list:
+ *   get:
+ *     operationId: getCollectionsList
+ *     description: List of collections
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ */
+api.get('/collections/list', async (req, res) => {
+  collectionsList(client).then(result => {
     res.status(200).json(result);
   });
 });

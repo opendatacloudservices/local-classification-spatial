@@ -82,3 +82,11 @@ export type DBMatchDetails = {
   abstract: string;
   format: string;
 };
+
+export type Collection = {
+  id: number;
+  type: string;
+  bbox: string;
+  name: string;
+  current_geometry_source_id: number;
+};

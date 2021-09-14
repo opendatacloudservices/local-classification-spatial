@@ -471,6 +471,43 @@ export const matchMatrix = async (
   return matches!.rows.map(r => [r.source_id, r.target_id]);
 };
 
+export const negativeMatchMatrix = async (
+  client: Client,
+  tableName: string,
+  source_id: number
+): Promise<{
+  missing: {geometry_fids: number[]; match_ids: number[]};
+  matches: {geometry_fids: number[]; match_ids: number[]};
+}> => {
+  const matrix = await matchMatrix(client, tableName, source_id);
+  const geometries_fid = matrix.map(m => m[0]);
+  const matchTable_id = matrix.map(m => m[1]);
+  const missingGeometryIds = await client
+    .query(
+      `SELECT fid FROM "Geometries" WHERE source_id = $1 AND fid NOT IN (${geometries_fid.join(
+        ','
+      )})`,
+      [source_id]
+    )
+    .then(result => (result.rowCount > 0 ? result.rows : []));
+  const missingMatchIds = await client
+    .query(
+      `SELECT id FROM ${tableName} WHERE id NOT IN (${matchTable_id.join(',')})`
+    )
+    .then(result => (result.rowCount > 0 ? result.rows : []));
+
+  return {
+    missing: {
+      geometry_fids: missingGeometryIds,
+      match_ids: missingMatchIds,
+    },
+    matches: {
+      geometry_fids: geometries_fid,
+      match_ids: matchTable_id,
+    },
+  };
+};
+
 export const collectionFromSource = (
   client: Client,
   source_id: number

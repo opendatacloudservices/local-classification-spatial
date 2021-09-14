@@ -1,6 +1,14 @@
 import {exec} from 'child_process';
 import {Client} from 'pg';
-import {toSingleGeomType, getGeometryType, matchMatrix} from '../postgis/index';
+import {
+  getGeometryType,
+  matchMatrix,
+  negativeMatchMatrix,
+} from '../postgis/index';
+import {getColumns} from '../postgres';
+import {create as createCollection} from '../postgres/collections';
+import {getFromImportID} from '../postgres/downloads';
+import {getMatch} from '../postgres/matches';
 import type {Columns, Results, Match} from '../types';
 import {date2timestamp} from '../utils';
 
@@ -50,79 +58,6 @@ export const dropImport = async (
 };
 
 // TODO: separate all collection functions into postgres/collection.ts
-
-export const createCollection = async (
-  client: Client,
-  tableName: string,
-  collectionName: string,
-  nameColumn: string,
-  spatColumn?: string | null
-): Promise<number> => {
-  const geomType = await toSingleGeomType(
-    await getGeometryType(client, tableName),
-    client,
-    tableName
-  );
-  const bbox = await client
-    .query(`SELECT ST_AsText(ST_Extent(geom)) AS bbox FROM ${tableName}`)
-    .then(result => result.rows[0].bbox);
-  const collectionId = await client
-    .query(
-      'INSERT INTO "Collections" (name, type, bbox) VALUES ($1, $2, ST_GeomFromText($3)) RETURNING id',
-      [collectionName, geomType, bbox]
-    )
-    .then(result => result.rows[0].id);
-
-  // TODO: Move other parts into distinct function
-
-  await client.query(
-    `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${collectionId} FROM ${tableName}_cln`
-  );
-
-  await client.query(
-    `INSERT INTO "GeometryProps" 
-      (fid, collection_id, name, centroid, area, len, spat_id)
-    SELECT
-      fid,
-      ${collectionId},
-      ${nameColumn},
-      ST_Centroid(geom),
-      ${geomType === 'POLYGON' ? 'ST_Area(geom)' : 'NULL'},
-      ${geomType === 'LINESTRING' ? 'ST_LENGTH(geom)' : 'NULL'},
-      ${spatColumn ? spatColumn : 'NULL'}
-    FROM
-      ${tableName}`
-  );
-
-  return collectionId;
-};
-
-export const dropCollection = async (
-  client: Client,
-  id: number
-): Promise<void> => {
-  const sources = await client
-    .query('SELECT id FROM "Sources" WHERE collection_id = $1', [id])
-    .then(result => result.rows);
-
-  if (sources && sources.length > 0) {
-    const tables = ['Geometries', 'GeometryProps', 'GeometryAttribues'];
-    await Promise.all(
-      tables.map(t =>
-        client.query(
-          `DELETE FROM "${t}" WHERE source_id IN (${sources.join(',')})`
-        )
-      )
-    );
-    await client.query(
-      `DELETE FROM "Sources" WHERE id IN (${sources.join(',')})`
-    );
-  }
-
-  return client
-    .query('DELETE FROM "Collections" WHERE id = $1', [id])
-    .then(() => {});
-};
 
 // const columns = filterColumns(await getColumns(client, tableName));
 
@@ -435,25 +370,34 @@ export const createSource = async (
   odcsClient: Client,
   updated: Date,
   import_id: number | null,
-  collection_id: number
+  collection_id: number,
+  hausdorff?: string | null,
+  geometry_source_id?: number | null,
+  previous_source_id?: number | null
 ): Promise<number> => {
+  let insertValues: (boolean | string | number | null | Date)[] = [];
+
   if (!import_id) {
-    return client
-      .query(
-        'INSERT INTO "Sources" (updated, manual, collection_id) VALUES ($1, $2, $3) RETURN id',
-        [updated, true, collection_id]
-      )
-      .then(r => r.rows[0].id);
+    insertValues = [null, updated, true, null];
+  } else {
+    const importData = await odcsClient
+      .query('SELECT * FROM "Imports" WHERE id = $1', [import_id])
+      .then(r => r.rows[0]);
+
+    insertValues = [import_id, updated, false, importData.meta_license];
   }
 
-  const importData = await odcsClient
-    .query('SELECT * FROM "Imports" WHERE id = $1', [import_id])
-    .then(r => r.rows[0]);
+  insertValues.push(
+    collection_id,
+    hausdorff || null,
+    geometry_source_id || null,
+    previous_source_id || null
+  );
 
   return client
     .query(
-      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id) VALUES ($1, $2, $3, $4, $5) RETURN id',
-      [import_id, updated, false, importData.meta_license, collection_id]
+      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id, hausdorff, geometry_source_id, previous_source_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURN id',
+      insertValues
     )
     .then(r => r.rows[0].id);
 };
@@ -561,4 +505,106 @@ export const saveMatch = (
       ]
     )
     .then(result => result.rows[0].id);
+};
+
+export const importMatch = async (
+  client: Client,
+  odcsClient: Client,
+  id: number,
+  name: string,
+  nameColumn?: string | null,
+  spatColumn?: string | null,
+  geomOnly = false,
+  collectionId: number | null = null,
+  method = 'add', // replace, skip
+  previous?: number
+): Promise<number> => {
+  const match = await getMatch(client, id);
+  const download = await getFromImportID(odcsClient, match.import_id);
+  const geomType = await getGeometryType(client, match.table_name);
+
+  // create a new collection
+  if (!collectionId) {
+    collectionId = await createCollection(client, match.table_name, name);
+  }
+
+  // create an import source for the new data
+  const source_id = await createSource(
+    client,
+    odcsClient,
+    download.downloaded,
+    match.import_id,
+    collectionId,
+    JSON.stringify({
+      matches: match.matches,
+      matchesCount: match.matches_count,
+      differences: match.difference,
+    }),
+    null,
+    previous || null
+  );
+
+  if (method === 'add') {
+    // insert new geometries
+    await client.query(
+      `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${match.table_name}_cln`
+    );
+  } else if (previous) {
+    const matrix = await negativeMatchMatrix(
+      client,
+      match.table_name,
+      previous
+    );
+    if (method === 'replace') {
+      await client.query(
+        `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${
+          match.table_name
+        }_cln WHERE fid IN ${matrix.matches.geometry_fids.join(',')}`
+      );
+    } else if (method === 'skip') {
+      await client.query(
+        `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${
+          match.table_name
+        }_cln WHERE fid IN ${matrix.missing.geometry_fids.join(',')}`
+      );
+    }
+  } else {
+    throw new Error('invalid method or missing previous source_id');
+  }
+
+  // insert geometry properties
+  await client.query(
+    `INSERT INTO "GeometryProps" 
+      (fid, source_id, name, centroid, area, len, spat_id)
+    SELECT
+      fid,
+      ${collectionId},
+      ${nameColumn},
+      ST_Centroid(geom),
+      ${geomType === 'POLYGON' ? 'ST_Area(geom)' : 'NULL'},
+      ${geomType === 'LINESTRING' ? 'ST_LENGTH(geom)' : 'NULL'},
+      ${spatColumn ? spatColumn : 'NULL'}
+    FROM
+      ${match.table_name}
+    WHERE
+      fid IN (
+        SELECT fid FROM "Geometries" WHERE source_id = ${source_id} GROUP BY fid
+      )`
+  );
+
+  if (!geomOnly) {
+    const columns = await getColumns(client, match.table_name);
+    const values = await getImportValues(client, match.table_name, columns);
+
+    await importValues(
+      client,
+      match.table_name,
+      values,
+      columns,
+      download.downloaded,
+      source_id
+    );
+  }
+
+  return collectionId;
 };
