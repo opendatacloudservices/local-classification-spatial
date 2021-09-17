@@ -61,25 +61,16 @@ We need to add remote mapping to our opendataservices database.
         OPTIONS (schema_name 'public', table_name 'Imports');*/
 ```
 
+## Premise
+
+Geometries are always split up into their smallest units. Every such geometry unit is only stored once in the database. If a geometry unit changes, old and new are both stored. Attributes are then connected to those such geometries.
+
 ## Data example
-
-**CollectionTypes**
-id: 1
-name: districts (Bezirk)
-
-The **CollectionTypes** *"districts"* is:
-
-child of *"city"* (Stadt)
-parent of *"neighborhoods"* (Stadtteil)
-
-this is stored in **CollectionTypeRelations**.
-
-The **CollectionTypes** *"districts"* has multiple collections, e.g.:
 
 **Collections**
 id: 1
-name: Bezirke Hamburg
-type: districts (1)
+name (unique): districts > the relationships of different types is documented in CollectionRelations
+type: POLYGON
 current_geometry_source_id: 1 (for performance store which source holds the current geometry)
 
 This specific collection received two geometry imports (two version at different times):
