@@ -6,13 +6,13 @@ import fetch from 'node-fetch';
 
 import {
   getImportValues,
-  checkValues,
   ogr,
   createSource,
   importValues,
   saveMatch,
   dropImport,
   importMatch,
+  finishImport,
 } from './import/index';
 import {sizeLimit} from './file/index';
 import {
@@ -29,18 +29,17 @@ import {
   cleanGeometries,
   collectionFromSource,
   matchGeometries,
-  matchMatrix,
   hasGeom,
 } from './postgis/index';
 import {
   list as matchesList,
   details as matchesDetails,
   geojsonClean as matchesGeojsonClean,
+  getMatch,
 } from './postgres/matches';
 import {
   list as collectionsList,
-  create as collectionCreate,
-  dropCollection,
+  drop as dropCollection,
 } from './postgres/collections';
 
 // get environmental variables
@@ -52,6 +51,7 @@ import {logError, addToken} from 'local-logger';
 import {wait} from './utils';
 import {handleXplan, isXplan} from './import/xplan';
 import {handleThematic, list as thematicList} from './import/thematic';
+import {getFromImportID} from './postgres/downloads';
 
 // connect to postgres (via env vars params)
 const client = new Client({
@@ -135,71 +135,86 @@ api.get('/next', async (req, res) => {
               await wait(2500);
 
               // match new geometries against existing geometries
-              const match = await matchGeometries(client, tableName + '_cln');
-              let check = false;
+              const match = await matchGeometries(client, tableName);
 
               // if there is a match, check if the geom-attributes already exist
               if (match.source_id) {
+                // TODO: for now we save all values, as it is more or less impossible to tell if its a duplicate???
+                // TODO: save the WFS layer name somewhere (its important)
+                // const columns = await getColumns(client, tableName);
+                // const values = await getImportValues(
+                //   client,
+                //   tableName,
+                //   columns
+                // );
+
+                // check = await checkValues(
+                //   client,
+                //   values,
+                //   columns,
+                //   match.source_id,
+                //   next.downloaded,
+                //   await matchMatrix(client, tableName, match.source_id)
+                // );
+
+                // if the attributes do not exist, insert into database
+                // if (check) {
+                //    INSERT ITS NEW
+                // } else {
+                //   // This already exists in our database
+                //   await saveMatch(
+                //     client,
+                //     next.id,
+                //     next.file,
+                //     match,
+                //     'duplicate',
+                //     tableName,
+                //     match.process?.differences
+                //   );
+                // }
+
+                // TODO: identify name columns and add to names array
+                const collection_id = await collectionFromSource(
+                  client,
+                  match.source_id
+                );
+
+                const source_id = await createSource(
+                  client,
+                  odcs_client,
+                  next.downloaded,
+                  next.id,
+                  collection_id,
+                  JSON.stringify(match.process) || null,
+                  match.source_id
+                );
+
                 const columns = await getColumns(client, tableName);
                 const values = await getImportValues(
                   client,
                   tableName,
                   columns
                 );
-                check = await checkValues(
+
+                await importValues(
                   client,
+                  tableName,
                   values,
                   columns,
-                  match.source_id,
-                  new Date('2021-08-26 14:46:00'),
-                  await matchMatrix(client, tableName, match.source_id)
+                  source_id,
+                  match.source_id
                 );
 
-                // if the attributes do not exist, insert into database
-                if (check) {
-                  // TODO: identify name columns and add to names array
-                  const collection_id = await collectionFromSource(
-                    client,
-                    match.source_id
-                  );
-
-                  const source_id = await createSource(
-                    client,
-                    odcs_client,
-                    next.downloaded,
-                    next.id,
-                    collection_id,
-                    JSON.stringify(match.process) || null,
-                    match.source_id
-                  );
-
-                  const columns = await getColumns(client, tableName);
-                  const values = await getImportValues(
-                    client,
-                    tableName,
-                    columns
-                  );
-
-                  await importValues(
-                    client,
-                    tableName,
-                    values,
-                    columns,
-                    next.downloaded,
-                    source_id
-                  );
-                } else {
-                  // This already exists in our database
-                  await saveMatch(
-                    client,
-                    next.id,
-                    next.file,
-                    match,
-                    'duplicate',
-                    tableName,
-                    match.process?.differences
-                  );
-                }
+                await setClassified(
+                  odcs_client,
+                  next.id,
+                  true,
+                  null,
+                  false,
+                  null,
+                  null,
+                  null
+                );
                 // remove temporary import table
                 await dropImport(client, tableName);
               } else {
@@ -216,10 +231,7 @@ api.get('/next', async (req, res) => {
                   await handleXplan(client, odcs_client, match_id);
                 }
               }
-              await setClassified(odcs_client, next.id);
-              res
-                .status(200)
-                .json({message: 'importing, success', match, check});
+              res.status(200).json({message: 'importing, success', match});
             } else {
               await setClassified(odcs_client, next.id, false);
               await dropImport(client, tableName);
@@ -248,9 +260,11 @@ api.get('/next', async (req, res) => {
       fetch(addToken(`http://localhost:${port}/next`, res));
     } else {
       // Everything from the opendataservice
+      active = false;
       res.status(200).json({message: 'nothing to import'});
     }
   } else {
+    active = false;
     if (!notified) {
       notified = true;
       notifier.notify({
@@ -278,23 +292,27 @@ api.get('/next', async (req, res) => {
  *         description: error
  *       200:
  *         description: success
+ *         examples:
+ *           application/json: { "message": "import in progress" }
+ *           application/json: { "message": "import started" }
  */
 api.get('/start', async (req, res) => {
   if (active) {
     res.status(200).json({message: 'import in progress'});
   } else {
-    // TODO: Call /next
-    res.status(200).json({message: 'nothing to import'});
+    active = true;
+    fetch(addToken(`http://localhost:${port}/next`, res));
+    res.status(200).json({message: 'import initiated'});
   }
 });
 
 /**
  * @swagger
  *
- * /import:
+ * /recheck:
  *   get:
- *     operationId: getImport
- *     description: Import a new spatial topology as a new collection
+ *     operationId: getRecheck
+ *     description: recheck already imported tables
  *     produces:
  *       - application/json
  *     responses:
@@ -302,6 +320,152 @@ api.get('/start', async (req, res) => {
  *         description: error
  *       200:
  *         description: success
+ *         examples:
+ *           application/json: { "message": "import in progress" }
+ *           application/json: { "message": "import started" }
+ */
+api.get('/recheck', async (req, res) => {
+  const matches = await matchesList(client);
+  res.status(200).json({message: 'recheck started', count: matches.length});
+  for (let m = 0; m < matches.length; m += 1) {
+    const match = await matchGeometries(client, matches[m].table_name);
+    if (match.source_id) {
+      const collection_id = await collectionFromSource(client, match.source_id);
+      const download = await getFromImportID(odcs_client, matches[m].import_id);
+
+      const source_id = await createSource(
+        client,
+        odcs_client,
+        download.downloaded,
+        matches[m].import_id,
+        collection_id,
+        JSON.stringify(match.process) || null,
+        match.source_id
+      );
+
+      const columns = await getColumns(client, matches[m].table_name);
+      const values = await getImportValues(
+        client,
+        matches[m].table_name,
+        columns
+      );
+
+      await importValues(
+        client,
+        matches[m].table_name,
+        values,
+        columns,
+        source_id,
+        match.source_id
+      );
+
+      await setClassified(
+        odcs_client,
+        matches[m].import_id,
+        true,
+        null,
+        false,
+        null,
+        null,
+        null
+      );
+      await dropImport(client, matches[m].table_name);
+    } else {
+      await saveMatch(
+        client,
+        matches[m].import_id,
+        matches[m].file,
+        match,
+        'no-match',
+        matches[m].table_name,
+        undefined,
+        matches[m].id
+      );
+    }
+  }
+  console.log('finished recheck');
+});
+
+/**
+ * @swagger
+ *
+ * /check/{id}:
+ *   get:
+ *     operationId: getRecheck
+ *     description: check a specific match
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "import in progress" }
+ *           application/json: { "message": "import started" }
+ */
+api.get('/check/:id', async (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({
+      message: 'Missing parameters (id)',
+    });
+  } else {
+    const match = await getMatch(client, parseInt(req.params.id.toString()));
+    const matching = await matchGeometries(client, match.table_name);
+    res.status(400).json(matching);
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /import/new:
+ *   get:
+ *     operationId: getImportNew
+ *     description: Import a new spatial topology as a new collection (and its attributes)
+ *     parameters:
+ *       - in: query
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *       - in: query
+ *         name: name
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name for the new collection
+ *       - in: query
+ *         name: nameColumn
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name of the column in which the names of geometries are stored in the to be imported table
+ *       - in: query
+ *         name: spatColumn
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: name of the column in which spatial identifiers of geometries are stored in the to be imported table
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing parameters
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "importing", collectionId: 123 }
  */
 api.get('/import/new', async (req, res) => {
   if (!req.query.id || !req.query.name || !req.query.nameColumn) {
@@ -314,11 +478,179 @@ api.get('/import/new', async (req, res) => {
       odcs_client,
       parseInt(req.query.id.toString()),
       req.query.name.toString(),
-      req.query.nameColumn.toString()
-      // TODO: spatColumn, geomOnly, collectionId, method, previous
+      req.query.nameColumn.toString(),
+      req.query.spatColumn ? req.query.spatColumn.toString() : null
     );
 
+    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
+
     res.status(200).json({message: 'importing', collectionId});
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /import/add:
+ *   get:
+ *     operationId: getImportAdd
+ *     description: Add a geometry to an existing collection (and its attributes)
+ *     parameters:
+ *       - in: query
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *       - in: query
+ *         name: name
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name for the new collection
+ *       - in: query
+ *         name: nameColumn
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name of the column in which the names of geometries are stored in the to be imported table
+ *       - in: query
+ *         name: collectionId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id of the collection this new geometries should be added to
+ *       - in: query
+ *         name: spatColumn
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: name of the column in which spatial identifiers of geometries are stored in the to be imported table
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing parameters
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "importing", collectionId: 123 }
+ */
+api.get('/import/add', async (req, res) => {
+  if (
+    !req.query.id ||
+    !req.query.name ||
+    !req.query.nameColumn ||
+    !req.query.collectionId
+  ) {
+    res.status(400).json({
+      message: 'Missing parameters (table, name, namecolumn, collectionId)',
+    });
+  } else {
+    const collectionId = await importMatch(
+      client,
+      odcs_client,
+      parseInt(req.query.id.toString()),
+      req.query.name.toString(),
+      req.query.nameColumn.toString(),
+      req.query.spatColumn ? req.query.spatColumn.toString() : null,
+      false,
+      parseInt(req.query.collectionId.toString())
+    );
+
+    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
+
+    res.status(200).json({message: 'importing add', collectionId});
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /import/update:
+ *   get:
+ *     operationId: getImportUpdate
+ *     description: Update a spatial topology within a collection (and add its attributes)
+ *     parameters:
+ *       - in: query
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *       - in: query
+ *         name: name
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name for the new collection
+ *       - in: query
+ *         name: nameColumn
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name of the column in which the names of geometries are stored in the to be imported table
+ *       - in: query
+ *         name: collectionId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id of the collection this new geometries should be added to
+ *       - in: query
+ *         name: previousSourceId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id of the old geometry's source
+ *       - in: query
+ *         name: spatColumn
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: name of the column in which spatial identifiers of geometries are stored in the to be imported table
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing parameters
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "importing", collectionId: 123 }
+ */
+api.get('/import/update', async (req, res) => {
+  if (
+    !req.query.id ||
+    !req.query.name ||
+    !req.query.nameColumn ||
+    !req.query.collectionId ||
+    !req.query.previousSourceId
+  ) {
+    res.status(400).json({
+      message:
+        'Missing parameters (table, name, namecolumn, collectionId, previousSourceId)',
+    });
+  } else {
+    const collectionId = await importMatch(
+      client,
+      odcs_client,
+      parseInt(req.query.id.toString()),
+      req.query.name.toString(),
+      req.query.nameColumn.toString(),
+      req.query.spatColumn ? req.query.spatColumn.toString() : null,
+      false,
+      parseInt(req.query.collectionId.toString()),
+      'add',
+      parseInt(req.query.previousSourceId.toString())
+    );
+
+    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
+
+    res.status(200).json({message: 'importing update', collectionId});
   }
 });
 
@@ -328,54 +660,128 @@ api.get('/import/new', async (req, res) => {
  * /import/merge:
  *   get:
  *     operationId: getImportMerge
- *     description: Import a new spatial topology as a new collection
+ *     description: Add a geometry to an existing collection, with a merge method (skip | replace), see Readme
+ *     parameters:
+ *       - in: query
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *       - in: query
+ *         name: name
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name for the new collection
+ *       - in: query
+ *         name: nameColumn
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: name of the column in which the names of geometries are stored in the to be imported table
+ *       - in: query
+ *         name: collectionId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id of the collection this new geometries should be added to
+ *       - in: query
+ *         name: previousSourceId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id of the old geometry's source
+ *       - in: query
+ *         name: method
+ *         required: true
+ *         schema:
+ *           type: string
+ *           enum:
+ *             - skip
+ *             - replace
+ *         description: method to use for adding the new geometry
+ *       - in: query
+ *         name: spatColumn
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: name of the column in which spatial identifiers of geometries are stored in the to be imported table
  *     produces:
  *       - application/json
  *     responses:
  *       500:
  *         description: error
+ *       400:
+ *         description: missing parameters or unallowed parameter values
  *       200:
  *         description: success
+ *         examples:
+ *           application/json: { "message": "importing", collectionId: 123 }
  */
 api.get('/import/merge', async (req, res) => {
-  // merge
+  if (
+    !req.query.id ||
+    !req.query.name ||
+    !req.query.nameColumn ||
+    !req.query.collectionId ||
+    !req.query.previousSourceId ||
+    !req.query.method ||
+    (req.query.method.toString() !== 'skip' &&
+      req.query.method.toString() !== 'replace')
+  ) {
+    res.status(400).json({
+      message:
+        'Missing parameters (table, name, namecolumn, collectionId, previousSourceId, method) or invalid method parameter: skip | replace',
+    });
+  } else {
+    // TODO: store merge action in source
+    const collectionId = await importMatch(
+      client,
+      odcs_client,
+      parseInt(req.query.id.toString()),
+      req.query.name.toString(),
+      req.query.nameColumn.toString(),
+      req.query.spatColumn ? req.query.spatColumn.toString() : null,
+      false,
+      parseInt(req.query.collectionId.toString()),
+      req.query.method.toString(),
+      parseInt(req.query.previousSourceId.toString())
+    );
+
+    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
+
+    res.status(200).json({message: 'importing update', collectionId});
+  }
 });
 
 /**
  * @swagger
  *
- * /import/update:
+ * /collections/drop/{id}:
  *   get:
- *     operationId: getImportUpdate
- *     description: Import a new spatial topology as a new collection
- *     produces:
- *       - application/json
- *     responses:
- *       500:
- *         description: error
- *       200:
- *         description: success
- */
-api.get('/import/merge', async (req, res) => {
-  // merge
-});
-
-/**
- * @swagger
- *
- * /drop:
- *   get:
- *     operationId: getDrop
+ *     operationId: getCollectionsDrop
  *     description: Drop a collection
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Collections
  *     produces:
  *       - application/json
  *     responses:
  *       500:
  *         description: error
+ *       400:
+ *         description: missing id parameter
  *       200:
  *         description: success
+ *         examples:
+ *           application/json: { "message": "dropped", id: 123 }
  */
-api.get('/drop/:id', async (req, res) => {
+api.get('/collections/drop/:id', async (req, res) => {
   if (!req.params.id) {
     res.status(400).json({message: 'Missing id parameter'});
   } else {
@@ -384,9 +790,6 @@ api.get('/drop/:id', async (req, res) => {
     res.status(200).json({message: 'dropped', id: req.params.id});
   }
 });
-
-// TODO: call /start
-// TODO: derive spatial relationships
 
 /**
  * @swagger
@@ -433,15 +836,24 @@ api.get('/collections/list', async (req, res) => {
 /**
  * @swagger
  *
- * /matches/details/:id:
+ * /matches/details/{id}:
  *   get:
  *     operationId: getMatchesDetails
  *     description: Get more details on a specific match
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
  *     produces:
  *       - application/json
  *     responses:
  *       500:
  *         description: error
+ *       400:
+ *         description: missing id parameter
  *       200:
  *         description: success
  */
@@ -458,15 +870,59 @@ api.get('/matches/details/:id', async (req, res) => {
 /**
  * @swagger
  *
- * /matches/geojson/:id:
+ * /matches/columns/{id}:
  *   get:
- *     operationId: getMatchesGeojson
- *     description: Get geojson representation of a match
+ *     operationId: getMatchesColumns
+ *     description: Get list of columns of the match's table
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
  *     produces:
  *       - application/json
  *     responses:
  *       500:
  *         description: error
+ *       400:
+ *         description: missing id parameter
+ *       200:
+ *         description: success
+ */
+api.get('/matches/columns/:id', async (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({message: 'Missing id parameter'});
+  } else {
+    // TODO: if id does not exist
+    const match = await getMatch(client, parseInt(req.params.id));
+    const columns = await getColumns(client, match.table_name);
+    res.status(200).json(columns);
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /matches/geojson/{id}:
+ *   get:
+ *     operationId: getMatchesGeojson
+ *     description: Get geojson representation of a match
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing id parameter
  *       200:
  *         description: success
  */
@@ -483,15 +939,24 @@ api.get('/matches/geojson/:id', async (req, res) => {
 /**
  * @swagger
  *
- * /matches/setxplan/:id:
+ * /matches/setxplan/{id}:
  *   get:
  *     operationId: getMatchesSetXPlan
  *     description: Classify an import as xplan
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
  *     produces:
  *       - application/json
  *     responses:
  *       500:
  *         description: error
+ *       400:
+ *         description: missing id parameter
  *       200:
  *         description: success
  */
@@ -510,15 +975,24 @@ api.get('/matches/setxplan/:id', async (req, res) => {
 /**
  * @swagger
  *
- * /matches/setthematic/:id:
+ * /matches/setthematic/{id}:
  *   get:
  *     operationId: getMatchesSetThematic
  *     description: Classify an import as thematic
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
  *     produces:
  *       - application/json
  *     responses:
  *       500:
  *         description: error
+ *       400:
+ *         description: missing id parameter
  *       200:
  *         description: success
  */

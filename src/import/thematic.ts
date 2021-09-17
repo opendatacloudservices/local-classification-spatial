@@ -62,7 +62,7 @@ export const handleThematic = async (
     thematicId = await createThematic(odcsClient, thematic, subthematic || '');
   }
 
-  const download_id = await setClassified(
+  await setClassified(
     odcsClient,
     match.import_id,
     true,
@@ -73,7 +73,7 @@ export const handleThematic = async (
     thematicId
   );
 
-  await downloadCompletion(odcsClient, download_id);
+  await downloadCompletion(odcsClient, match.import_id);
 
   const geojsonObj = await geojson(client, match.id);
 

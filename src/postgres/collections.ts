@@ -33,10 +33,7 @@ export const create = async (
   return collectionId;
 };
 
-export const dropCollection = async (
-  client: Client,
-  id: number
-): Promise<void> => {
+export const drop = async (client: Client, id: number): Promise<void> => {
   const sources = await client
     .query('SELECT id FROM "Sources" WHERE collection_id = $1', [id])
     .then(result => result.rows);

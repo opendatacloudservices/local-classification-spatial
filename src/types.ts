@@ -32,6 +32,7 @@ export type Match = {
   process?: {
     sources: number[];
     sourceCount: number[];
+    importCount: number;
     message: string;
     differences?: {
       source_id: number;
@@ -60,7 +61,7 @@ export type GeoJsonFeature = {
 export type DBMatch = {
   id: number;
   import_id: number;
-  file: number;
+  file: string;
   matches: number[];
   message: string;
   matches_count: number[];

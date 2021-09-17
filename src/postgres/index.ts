@@ -70,7 +70,7 @@ export const setClassified = (
   centroid: null | string = null,
   bbox: null | string = null,
   thematic: null | number = null
-): Promise<number> => {
+): Promise<void> => {
   const params = [];
 
   let query = 'UPDATE "DownloadedFiles" SET spatial_classification = TRUE';
@@ -107,10 +107,10 @@ export const setClassified = (
     params.push(thematic);
   }
 
-  query += `WHERE id = $${params.length + 1} RETURNING download_id`;
+  query += ` WHERE id = $${params.length + 1}`;
   params.push(id);
 
-  return client.query(query, params).then(result => result.rows[0].download_id);
+  return client.query(query, params).then(() => {});
 };
 
 export const getImportQueue = (client: Client): Promise<number> => {

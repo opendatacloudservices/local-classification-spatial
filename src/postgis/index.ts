@@ -28,7 +28,9 @@ export const getGeometryType = (
     )
     .then(async results => {
       if (results.rowCount < 1) {
-        throw Error('table does not exist or has no geometry column (geom).');
+        throw Error(
+          'table does not exist or has no geometry column (geom): ' + tableName
+        );
       }
 
       let type = results.rows[0].type;
@@ -173,11 +175,14 @@ export const matchPoints = (
   open: boolean,
   source_id?: number
 ): Promise<QueryResult> => {
+  tableName = tableName + '_cln';
   return client.query(
     `WITH distances AS (SELECT
       "Geometries".id as target_id,
+      "Geometries".fid as target_fid,
       "Geometries".source_id AS source,
       ${tableName}.id as source_id,
+      ${tableName}.fid as source_fid,
       ST_Distance("Geometries".geom, ${tableName}.geom) AS dist
     FROM "Geometries"
     ${
@@ -187,13 +192,13 @@ export const matchPoints = (
     JOIN "Collections" ON "Sources".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
       ("Collections".type = 'POINT' OR "Collections".type = 'MULTIPOINT') AND 
-      ST_DWithin("Geometries".geom, ${tableName}.geom, 0.02)
+      ST_DWithin("Geometries".geom, ${tableName}.geom, 1/111195)
     `
         : `
-    CROSS JOIN ${tableName}
-        WHERE 
-          "Geometries".source_id = $1 AND
-          ST_Distance("Geometries".geom, ${tableName}.geom) < 0.02
+      JOIN ${tableName}
+      ON 
+        "Geometries".source_id = $1 AND
+        ST_DWithin("Geometries".geom, ${tableName}.geom, 1/111195)
     `
     }
     )
@@ -214,11 +219,14 @@ export const matchLines = (
   open: boolean,
   source_id?: number
 ): Promise<QueryResult> => {
+  tableName = tableName + '_cln';
   return client.query(
     `WITH distances AS (SELECT
       "Geometries".fid as target_id,
+      "Geometries".fid as target_fid,
       "Geometries".source_id AS source,
       ${tableName}.id as source_id,
+      ${tableName}.fid as source_fid,
       ST_HausdorffDistance("Geometries".geom, ${tableName}.geom) AS dist
     FROM "Geometries"
     ${
@@ -228,13 +236,13 @@ export const matchLines = (
     JOIN "Collections" ON "Sources".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
       ("Collections".type = 'LINESTRING' OR "Collections".type = 'MULTILINESTRING') AND 
-      ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
+      ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
     `
         : `
-    CROSS JOIN ${tableName}
-        WHERE 
+    JOIN ${tableName}
+      ON
           "Geometries".source_id = $1 AND
-          ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
+          ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
     `
     }
     )
@@ -269,11 +277,14 @@ export const matchPolygons = (
   open: boolean,
   source_id?: number
 ): Promise<QueryResult> => {
+  tableName = tableName + '_cln';
   return client.query(
     `WITH distances AS (SELECT 
       "Geometries".id as target_id,
+      "Geometries".fid as target_fid,
       "Geometries".source_id AS source,
       ${tableName}.id as source_id,
+      ${tableName}.fid as source_fid,
       ST_HausdorffDistance("Geometries".geom, ${tableName}.geom) AS dist
     FROM "Geometries"
     ${
@@ -283,13 +294,13 @@ export const matchPolygons = (
     JOIN "Collections" ON "Sources".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
       ("Collections".type = 'POLYGON' OR "Collections".type = 'MULTIPOLYGON') AND 
-      ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
+      ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
     `
         : `
-    CROSS JOIN ${tableName}
-      WHERE 
+    JOIN ${tableName}
+      ON 
         "Geometries".source_id = $1 AND
-        ST_Contains(ST_Buffer("Geometries".geom, 0.01), ${tableName}.geom)
+        ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
     `
     }
     )
@@ -365,6 +376,7 @@ export const matchGeometries = async (
   });
 
   const process = {
+    importCount: rowCount,
     sources: Object.keys(sources).map(key => parseInt(key)),
     sourceCount: Object.keys(sources).map(
       key => sources[parseInt(key.toString())]
@@ -417,7 +429,8 @@ export const matchGeometries = async (
   });
 
   if (matches!.rowCount === rowCount) {
-    return {source_id: dominantSource};
+    process.message = 'match';
+    return {source_id: dominantSource, process};
   } else {
     const collectionCount = await client.query(
       'SELECT COUNT(*) AS rowcount FROM "Geometries" WHERE source_id = $1',
@@ -445,7 +458,9 @@ export const matchMatrix = async (
   client: Client,
   tableName: string,
   source_id: number
-): Promise<[number, number][]> => {
+): Promise<[number[], number[]][]> => {
+  // RETURN: [[TMP_TABLE.id, TMP_TABLE.fid], [Geometry.id, Geometry.fid]][]
+
   const geometryType = await getGeometryType(client, tableName);
 
   let matches: QueryResult;
@@ -468,7 +483,10 @@ export const matchMatrix = async (
     matches = await matchLines(client, tableName, false, source_id);
   }
 
-  return matches!.rows.map(r => [r.source_id, r.target_id]);
+  return matches!.rows.map(r => [
+    [r.source_id, r.source_fid],
+    [r.target_id, r.target_fid],
+  ]);
 };
 
 export const negativeMatchMatrix = async (
@@ -476,15 +494,15 @@ export const negativeMatchMatrix = async (
   tableName: string,
   source_id: number
 ): Promise<{
-  missing: {geometry_fids: number[]; match_ids: number[]};
-  matches: {geometry_fids: number[]; match_ids: number[]};
+  missing: {geometry_ids: number[]; match_ids: number[]};
+  matches: {geometry_ids: number[]; match_ids: number[]};
 }> => {
   const matrix = await matchMatrix(client, tableName, source_id);
-  const geometries_fid = matrix.map(m => m[0]);
-  const matchTable_id = matrix.map(m => m[1]);
+  const geometries_id = matrix.map(m => m[1][0]);
+  const matchTable_id = matrix.map(m => m[0][0]);
   const missingGeometryIds = await client
     .query(
-      `SELECT fid FROM "Geometries" WHERE source_id = $1 AND fid NOT IN (${geometries_fid.join(
+      `SELECT id FROM "Geometries" WHERE source_id = $1 AND id NOT IN (${geometries_id.join(
         ','
       )})`,
       [source_id]
@@ -492,17 +510,19 @@ export const negativeMatchMatrix = async (
     .then(result => (result.rowCount > 0 ? result.rows : []));
   const missingMatchIds = await client
     .query(
-      `SELECT id FROM ${tableName} WHERE id NOT IN (${matchTable_id.join(',')})`
+      `SELECT id FROM "${tableName}_cln" WHERE id NOT IN (${matchTable_id.join(
+        ','
+      )})`
     )
     .then(result => (result.rowCount > 0 ? result.rows : []));
 
   return {
     missing: {
-      geometry_fids: missingGeometryIds,
+      geometry_ids: missingGeometryIds,
       match_ids: missingMatchIds,
     },
     matches: {
-      geometry_fids: geometries_fid,
+      geometry_ids: geometries_id,
       match_ids: matchTable_id,
     },
   };

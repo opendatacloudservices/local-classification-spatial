@@ -128,7 +128,7 @@ export const handleXplan = async (
   const geom = await getGeomSummary(client, match.table_name);
   const geomType = await getGeometryType(client, match.table_name);
 
-  const download_id = await setClassified(
+  await setClassified(
     odcsClient,
     match.import_id,
     true,
@@ -138,7 +138,7 @@ export const handleXplan = async (
     geom.bbox
   );
 
-  await downloadCompletion(odcsClient, download_id);
+  await downloadCompletion(odcsClient, match.import_id);
 
   const geojsonObj = await geojson(client, match.id);
 

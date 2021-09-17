@@ -2,10 +2,12 @@ import {exec} from 'child_process';
 import {Client} from 'pg';
 import {
   getGeometryType,
+  getGeomSummary,
   matchMatrix,
   negativeMatchMatrix,
+  toSingleGeomType,
 } from '../postgis/index';
-import {getColumns} from '../postgres';
+import {getColumns, setClassified} from '../postgres';
 import {create as createCollection} from '../postgres/collections';
 import {getFromImportID} from '../postgres/downloads';
 import {getMatch} from '../postgres/matches';
@@ -47,6 +49,12 @@ export const ogr = (
   });
 };
 
+export const dropImportById = (client: Client, id: number): Promise<void> => {
+  return getMatch(client, id).then(match =>
+    dropImport(client, match.table_name)
+  );
+};
+
 export const dropImport = async (
   client: Client,
   tableName: string
@@ -54,6 +62,9 @@ export const dropImport = async (
   return client
     .query(`DROP TABLE IF EXISTS "${tableName}"`)
     .then(() => client.query(`DROP TABLE IF EXISTS "${tableName}_cln"`))
+    .then(() =>
+      client.query('DELETE FROM "Matches" WHERE table_name = $1', [tableName])
+    )
     .then(() => {});
 };
 
@@ -74,20 +85,12 @@ export const getImportValues = async (
 };
 
 export const matrixToValuesMatrix = (
-  matrix: [number, number][],
-  values: Results
+  matrix: [number[], number[]][]
 ): {[index: number]: number} => {
   const valuesMatrixMap: {[index: number]: number} = {};
   matrix.forEach(m => {
-    let targetKey = -1;
-    values.forEach((v, vi) => {
-      if (v.fid === m[0]) {
-        targetKey = vi;
-      }
-    });
-    valuesMatrixMap[m[1]] = targetKey;
+    valuesMatrixMap[m[0][1]] = m[1][1];
   });
-
   return valuesMatrixMap;
 };
 
@@ -97,11 +100,11 @@ export const checkValues = async (
   columns: Columns,
   source_id: number,
   updated: Date,
-  matrix: [number, number][]
+  matrix: [number[], number[]][]
 ): Promise<boolean> => {
   let hasNewData = true;
 
-  const valuesMatrixMap = matrixToValuesMatrix(matrix, values);
+  const valuesMatrixMap = matrixToValuesMatrix(matrix);
 
   // check if timestamp already exists in the database
   const exists = await client
@@ -179,7 +182,7 @@ export const checkAgainstTimestamp = async (
   for (let ci = 0; ci < columns.length; ci += 1) {
     const currentValues = await client
       .query(
-        'SELECT * FROM "GeometryAttributes" WHERE key = $1 update = $2 AND source_id = $3',
+        'SELECT * FROM "GeometryAttributes" WHERE key = $1 AND source_id = $3',
         [columns[ci].name, timestamp, source_id]
       )
       .then(r => r.rows);
@@ -396,7 +399,7 @@ export const createSource = async (
 
   return client
     .query(
-      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id, hausdorff, geometry_source_id, previous_source_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURN id',
+      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id, hausdorff, geometry_source_id, previous_source_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
       insertValues
     )
     .then(r => r.rows[0].id);
@@ -407,75 +410,107 @@ export const importValues = async (
   tableName: string,
   values: Results,
   columns: Columns,
-  updated: Date,
-  source_id: number
+  source_id: number,
+  geom_source_id?: number
 ): Promise<void> => {
-  const matrix = await matchMatrix(client, tableName, source_id);
-  const valuesMatrixMap = matrixToValuesMatrix(matrix, values);
+  const matrix = await matchMatrix(
+    client,
+    tableName,
+    geom_source_id ? geom_source_id : source_id
+  );
+  const valuesMatrixMap = matrixToValuesMatrix(matrix);
   for (let c = 0; c < columns.length; c += 1) {
-    const inserts: (number | string | null | number[] | string[] | Date)[] = [];
-    let valueString = '';
+    if (columns[c].name !== 'fid' && columns[c].name !== 'geom') {
+      const inserts: (number | string | null | number[] | string[] | Date)[] =
+        [];
+      let valueString = '';
 
-    values.forEach((v, vi) => {
-      if (valueString !== '') {
-        valueString += ',';
-      }
-      valueString += `(
-        $${vi * 5 + 1},
-        $${vi * 5 + 2},
-        $${vi * 5 + 3},
-        $${vi * 5 + 4},
-        $${vi * 5 + 5})`;
+      let valueCounter = 0;
+      values.forEach(v => {
+        if (v[columns[c].name] !== null) {
+          if (valueString !== '') {
+            valueString += ',';
+          }
+          valueString += `(
+            $${valueCounter * 4 + 1},
+            $${valueCounter * 4 + 2},
+            $${valueCounter * 4 + 3},
+            $${valueCounter * 4 + 4})`;
 
-      inserts.push(
-        updated,
-        valuesMatrixMap[parseInt(v.fid!.toString())],
-        source_id,
-        columns[c].name,
-        v[columns[c].name]
-      );
-    });
+          inserts.push(
+            valuesMatrixMap[parseInt(v.fid!.toString())],
+            source_id,
+            columns[c].name,
+            v[columns[c].name]
+          );
 
-    let targetType = 'str_val';
-    switch (columns[c].type) {
-      case 'ARRAY':
-        if (columns[c].udt.indexOf('float') >= 0) {
-          targetType = 'float_a_val';
-        } else if (columns[c].udt.indexOf('int') >= 0) {
-          targetType = 'int_a_val';
-        } else if (
-          columns[c].udt.indexOf('text') >= 0 ||
-          columns[c].udt.indexOf('char') >= 0
-        ) {
-          targetType = 'str_a_val';
+          valueCounter += 1;
         }
-        break;
-      case 'smallint':
-      case 'integer':
-        targetType = 'int_val';
-        break;
-      case 'double precision':
-        targetType = 'float_val';
-        break;
-      default:
-        targetType = 'str_val';
-        break;
+      });
+
+      let targetType = 'str_val';
+      switch (columns[c].type) {
+        case 'ARRAY':
+          if (columns[c].udt.indexOf('float') >= 0) {
+            targetType = 'double_a_val';
+          } else if (columns[c].udt.indexOf('int') >= 0) {
+            targetType = 'int_a_val';
+          } else if (
+            columns[c].udt.indexOf('text') >= 0 ||
+            columns[c].udt.indexOf('char') >= 0
+          ) {
+            targetType = 'str_a_val';
+          }
+          break;
+        case 'smallint':
+        case 'integer':
+          targetType = 'int_val';
+          break;
+        case 'double precision':
+          targetType = 'double_val';
+          break;
+        default:
+          targetType = 'str_val';
+          break;
+      }
+      if (valueString !== '') {
+        await client.query(
+          `INSERT INTO
+          "GeometryAttributes"
+          (
+            fid,
+            source_id,
+            key,
+            ${targetType}
+          )
+          VALUES
+          ${valueString}`,
+          inserts
+        );
+      }
     }
-    await client.query(
-      `INSERT INTO
-      "GeometriesAttributes"
-      (
-        updated,
-        fid,
-        source_id,
-        key,
-        ${targetType}
-      )
-      VALUES
-      ${valueString}`,
-      inserts
-    );
   }
+};
+
+export const finishImport = async (
+  client: Client,
+  odcsClient: Client,
+  id: number
+): Promise<void> => {
+  const match = await getMatch(client, id);
+  const geom = await getGeomSummary(client, match.table_name);
+  const geomType = await getGeometryType(client, match.table_name);
+  await setClassified(
+    odcsClient,
+    match.import_id,
+    true,
+    geomType,
+    false,
+    geom.centroid,
+    geom.bbox,
+    null
+  );
+  await dropImportById(client, id);
 };
 
 export const saveMatch = (
@@ -489,22 +524,38 @@ export const saveMatch = (
     source_id: number;
     target_id: number;
     dist: number;
-  }[]
+  }[],
+  match_id?: number
 ): Promise<number> => {
-  return client
-    .query(
-      'INSERT INTO "Matches" (import_id, file, matches, message, matches_count, table_name, difference) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
-      [
-        import_id,
-        file,
-        match.process?.sources,
-        message,
-        match.process?.sourceCount,
-        tableName,
-        difference ? JSON.stringify(difference) : null,
-      ]
-    )
-    .then(result => result.rows[0].id);
+  if (match_id) {
+    return client
+      .query(
+        'UPDATE "Matches" SET matches = $1, message = $2, matches_count = $3, difference = $4 WHERE id = $5',
+        [
+          match.process?.sources,
+          message,
+          match.process?.sourceCount,
+          difference ? JSON.stringify(difference) : null,
+          match_id,
+        ]
+      )
+      .then(() => match_id);
+  } else {
+    return client
+      .query(
+        'INSERT INTO "Matches" (import_id, file, matches, message, matches_count, table_name, difference) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+        [
+          import_id,
+          file,
+          match.process?.sources,
+          message,
+          match.process?.sourceCount,
+          tableName,
+          difference ? JSON.stringify(difference) : null,
+        ]
+      )
+      .then(result => result.rows[0].id);
+  }
 };
 
 export const importMatch = async (
@@ -521,7 +572,11 @@ export const importMatch = async (
 ): Promise<number> => {
   const match = await getMatch(client, id);
   const download = await getFromImportID(odcsClient, match.import_id);
-  const geomType = await getGeometryType(client, match.table_name);
+  const geomType = await toSingleGeomType(
+    await getGeometryType(client, match.table_name),
+    client,
+    match.table_name
+  );
 
   // create a new collection
   if (!collectionId) {
@@ -559,13 +614,13 @@ export const importMatch = async (
       await client.query(
         `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${
           match.table_name
-        }_cln WHERE fid IN ${matrix.matches.geometry_fids.join(',')}`
+        }_cln WHERE id IN ${matrix.matches.geometry_ids.join(',')}`
       );
     } else if (method === 'skip') {
       await client.query(
         `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${
           match.table_name
-        }_cln WHERE fid IN ${matrix.missing.geometry_fids.join(',')}`
+        }_cln WHERE id IN ${matrix.missing.geometry_ids.join(',')}`
       );
     }
   } else {
@@ -596,14 +651,7 @@ export const importMatch = async (
     const columns = await getColumns(client, match.table_name);
     const values = await getImportValues(client, match.table_name, columns);
 
-    await importValues(
-      client,
-      match.table_name,
-      values,
-      columns,
-      download.downloaded,
-      source_id
-    );
+    await importValues(client, match.table_name, values, columns, source_id);
   }
 
   return collectionId;
