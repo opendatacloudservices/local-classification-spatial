@@ -1,10 +1,14 @@
 import {Client} from 'pg';
+import {dropImport} from '../import';
 import {DBMatch, DBMatchDetails, GeoJson} from '../types';
 
-export const getMatch = (client: Client, id: number): Promise<DBMatch> => {
+export const getMatch = (
+  client: Client,
+  id: number
+): Promise<DBMatch | null> => {
   return client
     .query('SELECT * FROM "Matches" WHERE id = $1', [id])
-    .then(result => result.rows[0]);
+    .then(result => (result.rows ? result.rows[0] : null));
 };
 
 export const list = (client: Client): Promise<DBMatch[]> => {
@@ -41,7 +45,7 @@ export const geojsonClean = (client: Client, id: number): Promise<GeoJson> => {
     .query('SELECT table_name FROM "Matches" WHERE id = $1', [id])
     .then(results =>
       client.query(
-        `SELECT fid, ST_AsGeoJSON(geom) AS geometry FROM ${results.rows[0].table_name}_cln`
+        `SELECT fid, ST_AsGeoJson(ST_MakeValid(ST_CurveToLine(ST_Transform(geom_3857, 4326)))) AS geometry FROM ${results.rows[0].table_name}_cln`
       )
     )
     .then(results => {
@@ -54,7 +58,7 @@ export const geojson = (client: Client, id: number): Promise<GeoJson> => {
     .query('SELECT table_name FROM "Matches" WHERE id = $1', [id])
     .then(results =>
       client.query(
-        `SELECT *, ST_AsGeoJson(ST_MakeValid(geom)) AS geometry FROM ${results.rows[0].table_name}`
+        `SELECT *, ST_AsGeoJson(ST_MakeValid(ST_CurveToLine(geom_3857))) AS geometry FROM ${results.rows[0].table_name}`
       )
     )
     .then(results => {
@@ -73,7 +77,7 @@ export const generateGeoJson = (
   features.forEach(f => {
     const properties: {[index: string]: string | number} = {};
     Object.keys(f).forEach(k => {
-      if (k !== 'geometry' && k !== 'geom') {
+      if (k !== 'geometry' && k !== 'geom' && k !== 'geom_3857') {
         properties[k] = f[k];
       }
     });
@@ -85,4 +89,35 @@ export const generateGeoJson = (
   });
 
   return geojson;
+};
+
+const systemTables = [
+  'Collections',
+  'Geometries',
+  'GeometryAttributes',
+  'GeometryProps',
+  'Matches',
+  'Sources',
+  '_prisma_migrations',
+  'spatial_ref_sys',
+];
+
+export const removeMissingTables = async (client: Client): Promise<void> => {
+  const matches = await client
+    .query('SELECT table_name FROM "Matches"')
+    .then(result => result.rows.map(r => r.table_name));
+
+  const tables = await client
+    .query(
+      "SELECT * FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name LIKE 'db_%'"
+    )
+    .then(result => result.rows);
+
+  for (let t = 0; t < tables.length; t += 1) {
+    const name = tables[t].table_name;
+    const baseName = name.split('_cln')[0];
+    if (!systemTables.includes(name) && !matches.includes(baseName)) {
+      await dropImport(client, tables[t].table_name);
+    }
+  }
 };

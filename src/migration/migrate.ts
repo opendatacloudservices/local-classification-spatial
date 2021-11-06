@@ -18,5 +18,17 @@ client.connect().catch((err: Error) => {
   console.log({message: err});
 });
 
-import {removeMatchTables} from './index';
-removeMatchTables(client);
+// opendataservices database with imports
+const odcsClient = new Client({
+  user: process.env.ODCS_PGUSER,
+  host: process.env.ODCS_PGHOST,
+  database: process.env.ODCS_PGDATABASE,
+  password: process.env.ODCS_PGPASSWORD,
+  port: parseInt(process.env.ODCS_PGPORT || '5432'),
+});
+odcsClient.connect().catch((err: Error) => {
+  console.log({message: err});
+});
+
+import {exportCSV} from './index';
+exportCSV(client).then(() => console.log('updateBuffer'));

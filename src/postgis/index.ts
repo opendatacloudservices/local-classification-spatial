@@ -1,5 +1,5 @@
 import type {Client, QueryResult} from 'pg';
-import type {GeometryType, Match} from '../types';
+import type {GeometryType, Match, Matrix} from '../types';
 
 export const getGeomSummary = (
   client: Client,
@@ -7,7 +7,7 @@ export const getGeomSummary = (
 ): Promise<{bbox: string; centroid: string}> => {
   return client
     .query(
-      `SELECT ST_AsText(ST_Envelope(ST_Union(geom))) AS bbox, ST_AsText(ST_Centroid(ST_Union(geom))) AS centroid FROM ${tableName}`
+      `SELECT ST_AsText(ST_Envelope(ST_Collect(ST_Transform(geom_3857, 4326)))) AS bbox, ST_AsText(ST_Centroid(ST_Collect(ST_Transform(geom_3857, 4326)))) AS centroid FROM ${tableName}`
     )
     .then(result => result.rows[0]);
 };
@@ -22,7 +22,7 @@ export const getGeometryType = (
         FROM geometry_columns 
         WHERE f_table_schema = 'public' 
         AND f_table_name = $1 
-        AND f_geometry_column = 'geom';
+        AND f_geometry_column = 'geom_3857';
     `,
       [tableName]
     )
@@ -41,7 +41,7 @@ export const getGeometryType = (
       ) {
         const typeTest = await client
           .query(
-            `SELECT ST_AsText((ST_Dump(ST_Multi(ST_CurveToLine(geom)))).geom) AS text FROM ${tableName} LIMIT 1`
+            `SELECT ST_AsText((ST_Dump(ST_Multi(ST_CurveToLine(geom_3857)))).geom) AS text FROM ${tableName} LIMIT 1`
           )
           .then(result => result.rows[0].text);
         if (typeTest.indexOf('LINESTRING') > -1) {
@@ -49,7 +49,9 @@ export const getGeometryType = (
         }
       } else if (type === 'GEOMETRY' || type === 'GEOGRAPHY') {
         const typeTest = await client
-          .query(`SELECT ST_AsText(geom) AS text FROM ${tableName} LIMIT 1`)
+          .query(
+            `SELECT ST_AsText(geom_3857) AS text FROM ${tableName} LIMIT 1`
+          )
           .then(result => result.rows[0].text);
 
         if (typeTest.indexOf('LINESTRING') > -1) {
@@ -75,7 +77,7 @@ export const hasGeom = (
         FROM geometry_columns 
         WHERE f_table_schema = 'public' 
         AND f_table_name = $1 
-        AND f_geometry_column = 'geom';
+        AND f_geometry_column = 'geom_3857';
     `,
       [tableName]
     )
@@ -101,7 +103,7 @@ export const toSingleGeomType = async (
     geomType === 'GEOGRAPHYCOLLECTION'
   ) {
     const typeTest = await client
-      .query(`SELECT ST_AsText(geom) AS text FROM ${tableName} LIMIT 1`)
+      .query(`SELECT ST_AsText(geom_3857) AS text FROM ${tableName} LIMIT 1`)
       .then(result => result.rows[0].text);
 
     if (typeTest.indexOf('LINESTRING') > -1) {
@@ -130,14 +132,18 @@ export const cleanGeometries = async (
   await client.query(`CREATE TABLE ${newTableName} (
     id SERIAL PRIMARY KEY,
     fid INTEGER,
-    geom GEOMETRY(${newGeomType}, 4326)
+    geom_3857 GEOMETRY(${newGeomType}, 3857),
+    buffer GEOMETRY(${newGeomType}, 3857)
   )`);
 
   await client.query(
     `CREATE INDEX ${newTableName}_fid ON ${newTableName} (fid)`
   );
   await client.query(
-    `CREATE INDEX ${newTableName}_geom ON ${newTableName} USING gist(geom)`
+    `CREATE INDEX ${newTableName}_geom_3857 ON ${newTableName} USING gist(geom_3857)`
+  );
+  await client.query(
+    `CREATE INDEX ${newTableName}_buffer ON ${newTableName} USING gist(buffer)`
   );
 
   /*
@@ -146,178 +152,191 @@ export const cleanGeometries = async (
    * For now we had to remove this.
    */
 
-  let dumpStr = '(ST_Dump(ST_Multi(geom))).geom';
+  let dumpStr = '(ST_Dump(ST_Multi(ST_Force2D(geom_3857)))).geom';
   if (
     geomType === 'CURVEPOLYGON' ||
     geomType === 'MULTISURFACE' ||
     geomType === 'MULTICURVE' ||
     geomType === 'CURVEDLINE'
   ) {
-    dumpStr = '(ST_Dump(ST_Multi(ST_CurveToLine(geom)))).geom';
+    dumpStr = '(ST_Dump(ST_Multi(ST_CurveToLine(ST_Force2D(geom_3857))))).geom';
   } else if (
     geomType === 'GEOMETRYCOLLECTION' ||
     geomType === 'GEOGRAPHYCOLLECTION'
   ) {
-    dumpStr = '(ST_Dump(ST_Multi(ST_CollectionHomogenize(geom)))).geom';
+    dumpStr =
+      '(ST_Dump(ST_Multi(ST_CollectionHomogenize(ST_Force2D(geom_3857))))).geom';
   }
 
   await client.query(`
-    INSERT INTO ${newTableName} (fid, geom) 
+    INSERT INTO ${newTableName} (fid, geom_3857) 
     SELECT fid, ${dumpStr} FROM ${tableName}
   `);
+
+  await client.query(
+    `UPDATE ${newTableName} SET buffer = ST_Buffer(ST_MakeValid(geom_3857), 50)`
+  );
 
   return newTableName;
 };
 
+// This function returns all points with a matching point within 1m distance
 export const matchPoints = (
   client: Client,
   tableName: string,
   open: boolean,
-  source_id?: number
+  collection_id?: number
 ): Promise<QueryResult> => {
   tableName = tableName + '_cln';
   return client.query(
     `WITH distances AS (SELECT
+      "Sources".collection_id AS collection_id,
       "Geometries".id as target_id,
       "Geometries".fid as target_fid,
       "Geometries".source_id AS source,
       ${tableName}.id as source_id,
       ${tableName}.fid as source_fid,
-      ST_Distance("Geometries".geom, ${tableName}.geom) AS dist
+      ST_DistanceSpheroid("Geometries".geom_3857, ${tableName}.geom_3857) AS dist
     FROM "Geometries"
     ${
-      open
+      open || !collection_id
         ? `
     JOIN "Sources" ON "Geometries".source_id = "Sources".id
-    JOIN "Collections" ON "Sources".collection_id = "Collections".id
+    JOIN "Collections" ON "Sources".collection_id = "Collections".id AND ("Collections".type = 'POINT' OR "Collections".type = 'MULTIPOINT')
     INNER JOIN ${tableName} ON
-      ("Collections".type = 'POINT' OR "Collections".type = 'MULTIPOINT') AND 
-      ST_DWithin("Geometries".geom, ${tableName}.geom, 1/111195)
+      ST_Contains("Geometries".buffer, ${tableName}.geom_3857)
     `
         : `
+      JOIN "Sources" ON "Geometries".source_id = "Sources".id AND "Sources".collection_id = ${collection_id}
       JOIN ${tableName}
       ON 
-        "Geometries".source_id = $1 AND
-        ST_DWithin("Geometries".geom, ${tableName}.geom, 1/111195)
+      ST_Contains("Geometries".buffer, ${tableName}.geom_3857) AND ST_Contains(${tableName}.buffer, ST_Transform("Geometries".geom_3857)
     `
     }
     )
-    SELECT d1.* FROM distances d1
+    SELECT DISTINCT ON (d1.source_id) d1.* FROM distances d1
     JOIN (
         SELECT source_id, MIN(dist) AS min_dist
         FROM distances
         GROUP BY source_id
     ) d2
-    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist`,
-    open ? [] : [source_id]
+    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist AND d1.source_id IS NOT NULL`
   );
 };
 
+// This function returns all lines, that have a matching line contained within a 5 meter buffer area
 export const matchLines = (
   client: Client,
   tableName: string,
   open: boolean,
-  source_id?: number
+  collection_id?: number,
+  similar = false
 ): Promise<QueryResult> => {
   tableName = tableName + '_cln';
   return client.query(
     `WITH distances AS (SELECT
-      "Geometries".fid as target_id,
-      "Geometries".fid as target_fid,
+      "Sources".collection_id AS collection_id,
+      "Geometries".fid AS target_id,
+      "Geometries".fid AS target_fid,
       "Geometries".source_id AS source,
-      ${tableName}.id as source_id,
-      ${tableName}.fid as source_fid,
-      ST_HausdorffDistance("Geometries".geom, ${tableName}.geom) AS dist
+      ${tableName}.id AS source_id,
+      ${tableName}.fid AS source_fid,
+      ST_Length(ST_Difference(ST_MakeValid("Geometries".geom_3857), ST_MakeValid(${tableName}.geom_3857))) / ST_Length("Geometries".geom_3857) * 100 AS target_diff,
+      ST_Length(ST_Difference(ST_MakeValid(${tableName}.geom_3857), ST_MakeValid("Geometries".geom_3857))) / ST_Length(${tableName}.geom_3857) * 100 AS source_diff,
+      ST_HausdorffDistance("Geometries".geom_3857, ${tableName}.geom_3857) AS dist
     FROM "Geometries"
     ${
-      open
+      open || !collection_id
         ? `
     JOIN "Sources" ON "Geometries".source_id = "Sources".id
     JOIN "Collections" ON "Sources".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
-      ("Collections".type = 'LINESTRING' OR "Collections".type = 'MULTILINESTRING') AND 
-      ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
+      ("Collections".type = 'LINESTRING' OR "Collections".type = 'MULTILINESTRING') AND
+      ST_Intersects(ST_MakeValid("Geometries".geom_3857), ST_MakeValid(${tableName}.geom_3857)) AND ${
+            similar
+              ? `ST_Contains(ST_Buffer("Geometries".geom_3857, 100), ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(ST_Buffer(${tableName}.geom_3857, 100), "Geometries".geom_3857)`
+              : `ST_Contains("Geometries".buffer, ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(${tableName}.buffer, "Geometries".geom_3857)`
+          }
+     
     `
         : `
+    JOIN "Sources" ON "Geometries".source_id = "Sources".id
     JOIN ${tableName}
       ON
-          "Geometries".source_id = $1 AND
-          ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
+          "Sources".collection_id = ${collection_id} AND
+          ST_Intersects(ST_MakeValid("Geometries".geom_3857), ST_MakeValid(${tableName}.geom_3857)) AND ${
+            similar
+              ? `ST_Contains(ST_Buffer("Geometries".geom_3857, 100), ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(ST_Buffer(${tableName}.geom_3857, 100), "Geometries".geom_3857)`
+              : `ST_Contains("Geometries".buffer, ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(${tableName}.buffer, "Geometries".geom_3857)`
+          }
     `
     }
     )
-    SELECT d1.* FROM distances d1
+    SELECT DISTINCT ON (d1.source_id) d1.* FROM distances d1
     JOIN (
         SELECT source_id, MIN(dist) AS min_dist
         FROM distances
         GROUP BY source_id
     ) d2
-    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist`,
-    open ? [] : [source_id]
+    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist AND d1.source_id IS NOT NULL`
   );
-  /*
-    WHERE
-      (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
-      ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
-      AND
-      (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
-      ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
-    AND
-      (ST_Length("Geometries".geom) > ST_Length(${tableName}.geom) * 0.9 AND
-      ST_Length("Geometries".geom) < ST_Length(${tableName}.geom) * 1.1)
-      AND
-      (ST_Area(ST_Envelope("Geometries".geom)) > ST_Area(ST_Envelope(${tableName}.geom)) * 0.9 AND
-      ST_Area(ST_Envelope("Geometries".geom)) < ST_Area(ST_Envelope(${tableName}.geom)) * 1.1)
-  */
 };
 
+// This function return all polygons that have a matching polygon contained within a 5 meter buffer
 export const matchPolygons = (
   client: Client,
   tableName: string,
   open: boolean,
-  source_id?: number
+  collection_id?: number,
+  similar = false
 ): Promise<QueryResult> => {
   tableName = tableName + '_cln';
   return client.query(
     `WITH distances AS (SELECT 
-      "Geometries".id as target_id,
-      "Geometries".fid as target_fid,
+      "Sources".collection_id AS collection_id,
+      "Geometries".id AS target_id,
+      "Geometries".fid AS target_fid,
       "Geometries".source_id AS source,
-      ${tableName}.id as source_id,
-      ${tableName}.fid as source_fid,
-      ST_HausdorffDistance("Geometries".geom, ${tableName}.geom) AS dist
+      ${tableName}.id AS source_id,
+      ${tableName}.fid AS source_fid,
+      ST_Area(ST_Difference(ST_MakeValid("Geometries".geom_3857), ST_MakeValid(${tableName}.geom_3857))) / ST_Area("Geometries".geom_3857) * 100 AS target_diff,
+      ST_Area(ST_Difference(ST_MakeValid(${tableName}.geom_3857), ST_MakeValid("Geometries".geom_3857))) / ST_Area(${tableName}.geom_3857) * 100 AS source_diff,
+      ST_HausdorffDistance("Geometries".geom_3857, ${tableName}.geom_3857) AS dist
     FROM "Geometries"
     ${
-      open
+      open || !collection_id
         ? `
     JOIN "Sources" ON "Geometries".source_id = "Sources".id
     JOIN "Collections" ON "Sources".collection_id = "Collections".id
     INNER JOIN ${tableName} ON
-      ("Collections".type = 'POLYGON' OR "Collections".type = 'MULTIPOLYGON') AND 
-      ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
+      ("Collections".type = 'POLYGON' OR "Collections".type = 'MULTIPOLYGON') AND
+      ST_Intersects(ST_MakeValid("Geometries".geom_3857), ST_MakeValid(${tableName}.geom_3857)) AND ${
+            similar
+              ? `ST_Contains(ST_Buffer("Geometries".geom_3857, 100), ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(ST_Buffer(${tableName}.geom_3857, 100), "Geometries".geom_3857)`
+              : `ST_Contains("Geometries".buffer, ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(${tableName}.buffer, "Geometries".geom_3857)`
+          }
     `
         : `
+    JOIN "Sources" ON "Geometries".source_id = "Sources".id
     JOIN ${tableName}
       ON 
-        "Geometries".source_id = $1 AND
-        ST_Contains(ST_Buffer("Geometries".geom, 5/111195), ${tableName}.geom)
+        "Sources".collection_id = ${collection_id} AND
+        ST_Intersects(ST_MakeValid("Geometries".geom_3857), ST_MakeValid(${tableName}.geom_3857)) AND ${
+            similar
+              ? `ST_Contains(ST_Buffer("Geometries".geom_3857, 100), ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(ST_Buffer(${tableName}.geom_3857, 100), "Geometries".geom_3857)`
+              : `ST_Contains("Geometries".buffer, ST_MakeValid(${tableName}.geom_3857)) AND ST_Contains(${tableName}.buffer, "Geometries".geom_3857)`
+          }
     `
     }
     )
-    SELECT d1.* FROM distances d1
+    SELECT DISTINCT ON (d1.source_id) d1.* FROM distances d1
     JOIN (
         SELECT source_id, MIN(dist) AS min_dist
         FROM distances
         GROUP BY source_id
     ) d2
-    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist`,
-    open ? [] : [source_id]
+    ON d1.source_id = d2.source_id AND d1.dist = d2.min_dist AND d1.source_id IS NOT NULL`
   );
-  /*
-   * WHERE
-   *  ST_Area("Geometries".geom) > ST_Area(${tableName}.geom) * 0.9 AND
-   *    ST_Area("Geometries".geom) < ST_Area(${tableName}.geom) * 1.1
-   */
 };
 
 export const matchGeometries = async (
@@ -327,12 +346,12 @@ export const matchGeometries = async (
   const geometryType = await getGeometryType(client, tableName);
   // get number of rows
   const rowCount = await client
-    .query(`SELECT COUNT(*) AS rowcount FROM ${tableName}`)
+    .query(`SELECT COUNT(*) AS rowcount FROM ${tableName}_cln`)
     .then(result => {
       return parseInt(result.rows[0].rowcount);
     });
 
-  let matches: QueryResult;
+  let matches: QueryResult | null = null;
 
   // find best potential matches with an "open" approach
   if (geometryType === 'POINT' || geometryType === 'MULTIPOINT') {
@@ -354,56 +373,72 @@ export const matchGeometries = async (
   }
 
   // aggregate collections in result
-  const sources: {[index: number]: number} = {};
-  let sourceCount = 0;
-  matches!.rows.forEach(row => {
-    if (!(row.source in sources)) {
-      sources[row.source] = 0;
-      sourceCount++;
-    }
-    sources[row.source]++;
-  });
+  const collections: {[index: number]: number} = {};
+  let collectionCount = 0;
+  if (matches && matches.rows) {
+    matches.rows.forEach(row => {
+      if (!(row.collection_id in collections)) {
+        collections[row.collection_id] = 0;
+        collectionCount++;
+      }
+      collections[row.collection_id]++;
+    });
+  }
 
   // identify dominant collection across matches
-  let dominantSource = -1;
+  let dominantCollection = -1;
   let dominantCount = 0;
-  Object.keys(sources).forEach(id => {
+  Object.keys(collections).forEach(id => {
     const iid = parseInt(id);
-    if (sources[iid] > dominantCount) {
-      dominantCount = sources[iid];
-      dominantSource = iid;
+    if (collections[iid] > dominantCount) {
+      dominantCount = collections[iid];
+      dominantCollection = iid;
     }
   });
 
   const process = {
     importCount: rowCount,
-    sources: Object.keys(sources).map(key => parseInt(key)),
-    sourceCount: Object.keys(sources).map(
-      key => sources[parseInt(key.toString())]
+    sources: Object.keys(collections).map(key => parseInt(key)),
+    sourceCount: Object.keys(collections).map(
+      key => collections[parseInt(key.toString())]
     ),
     message: '',
-    differences: matches!.rows.map(r => {
-      return {
-        source_id: r.source_id,
-        target_id: r.target_id,
-        dist: r.dist,
-      };
-    }),
+    differences:
+      matches && matches.rows
+        ? matches.rows.map(r => {
+            return {
+              collection_id: r.collection_id,
+              source_id: r.source_id,
+              target_id: r.target_id,
+              source_fid: r.source_id,
+              target_fid: r.target_id,
+              source_diff: r.source_diff || null,
+              target_diff: r.target_diff || null,
+              dist: r.dist,
+            };
+          })
+        : [],
   };
 
-  if (dominantSource === -1) {
+  if (dominantCollection === -1) {
+    // no proper matches were returned
     process.message = 'no-match';
     return {
-      source_id: null,
+      collection_id: null,
       process,
     };
-  } else if (sourceCount === 1 && matches!.rowCount === rowCount) {
-    return {source_id: dominantSource};
+  } else if (
+    collectionCount === 1 &&
+    matches &&
+    matches.rowCount === rowCount
+  ) {
+    // only one matching geom was returned and matches for all elements are included
+    return {collection_id: dominantCollection};
   }
 
   // check aginst the dominant collection
   if (geometryType === 'POINT' || geometryType === 'MULTIPOINT') {
-    matches = await matchPoints(client, tableName, false, dominantSource);
+    matches = await matchPoints(client, tableName, false, dominantCollection);
   } else if (
     geometryType === 'POLYGON' ||
     geometryType === 'MULTIPOLYGON' ||
@@ -411,62 +446,96 @@ export const matchGeometries = async (
     geometryType === 'MULTICURVE' ||
     geometryType === 'MULTISURFACE'
   ) {
-    matches = await matchPolygons(client, tableName, false, dominantSource);
+    matches = await matchPolygons(client, tableName, false, dominantCollection);
   } else if (
     geometryType === 'LINESTRING' ||
     geometryType === 'MULTILINESTRING' ||
     geometryType === 'CURVEDLINE'
   ) {
-    matches = await matchLines(client, tableName, false, dominantSource);
+    matches = await matchLines(client, tableName, false, dominantCollection);
   }
 
-  process.differences = matches!.rows.map(r => {
-    return {
-      source_id: r.source_id,
-      target_id: r.target_id,
-      dist: r.dist,
-    };
-  });
+  if (matches && matches.rows) {
+    process.differences = matches!.rows.map(r => {
+      return {
+        collection_id: r.collection_id,
+        source_id: r.source_id,
+        target_id: r.target_id,
+        source_fid: r.source_id,
+        target_fid: r.target_id,
+        source_diff: r.source_diff || null,
+        target_diff: r.target_diff || null,
+        dist: r.dist,
+      };
+    });
 
-  if (matches!.rowCount === rowCount) {
-    process.message = 'match';
-    return {source_id: dominantSource, process};
-  } else {
-    const collectionCount = await client.query(
-      'SELECT COUNT(*) AS rowcount FROM "Geometries" WHERE source_id = $1',
-      [dominantSource]
-    );
-    if (matches!.rowCount === collectionCount!.rows[0].rowcount) {
-      process.message = 'subset';
-      process.sources = [dominantSource];
-      process.sourceCount = [collectionCount!.rows[0].rowcount];
-      return {
-        source_id: null,
-        process,
-      };
+    if (matches!.rowCount === rowCount) {
+      process.message = 'match';
+      return {collection_id: dominantCollection, process};
     } else {
-      process.message = 'no-match-2';
-      return {
-        source_id: null,
-        process,
-      };
+      const collectionCount = await client.query(
+        // The join makes sure we only get one "version" of each geometry
+        `WITH geoms AS (
+          SELECT g1.id, g2.id FROM
+            "Geometries" AS g1
+          JOIN
+            "Geometries" AS g2
+            ON g2.id = g1.previous
+          JOIN
+            "Sources"
+            ON "Sources".id = g1.source_id
+          WHERE
+            g2.id IS NULL AND
+            "Sources".collection_id = $1
+        )
+        SELECT
+          COUNT(*) AS rowcount
+        FROM
+          geoms
+        `,
+        [dominantCollection]
+      );
+      if (matches!.rowCount === collectionCount!.rows[0].rowcount) {
+        // the new set has more geometries than the original, but all existing parts match
+        process.message = 'subset';
+        process.sources = [dominantCollection];
+        process.sourceCount = [collectionCount!.rows[0].rowcount];
+        return {
+          collection_id: null,
+          process,
+        };
+      } else {
+        process.message = 'no-match-2';
+        return {
+          collection_id: null,
+          process,
+        };
+      }
     }
+  } else {
+    process.message = 'no-match-3';
+    process.differences = [];
+    return {
+      collection_id: null,
+      process,
+    };
   }
 };
 
 export const matchMatrix = async (
   client: Client,
   tableName: string,
-  source_id: number
-): Promise<[number[], number[]][]> => {
+  collection_id: number,
+  similar = false
+): Promise<Matrix> => {
   // RETURN: [[TMP_TABLE.id, TMP_TABLE.fid], [Geometry.id, Geometry.fid]][]
 
   const geometryType = await getGeometryType(client, tableName);
 
-  let matches: QueryResult;
+  let matches: QueryResult | null = null;
 
   if (geometryType === 'POINT' || geometryType === 'MULTIPOINT') {
-    matches = await matchPoints(client, tableName, false, source_id);
+    matches = await matchPoints(client, tableName, false, collection_id);
   } else if (
     geometryType === 'POLYGON' ||
     geometryType === 'MULTIPOLYGON' ||
@@ -474,58 +543,52 @@ export const matchMatrix = async (
     geometryType === 'MULTICURVE' ||
     geometryType === 'MULTISURFACE'
   ) {
-    matches = await matchPolygons(client, tableName, false, source_id);
+    matches = await matchPolygons(
+      client,
+      tableName,
+      false,
+      collection_id,
+      similar
+    );
   } else if (
     geometryType === 'LINESTRING' ||
     geometryType === 'MULTILINESTRING' ||
     geometryType === 'CURVEDLINE'
   ) {
-    matches = await matchLines(client, tableName, false, source_id);
+    matches = await matchLines(
+      client,
+      tableName,
+      false,
+      collection_id,
+      similar
+    );
   }
 
-  return matches!.rows.map(r => [
-    [r.source_id, r.source_fid],
-    [r.target_id, r.target_fid],
-  ]);
+  if (matches && matches.rows) {
+    return matches.rows.map(r => [
+      [r.source_id, r.source_fid],
+      [r.target_id, r.target_fid],
+      [r.dist],
+    ]);
+  } else {
+    return [];
+  }
 };
 
-export const negativeMatchMatrix = async (
-  client: Client,
-  tableName: string,
-  source_id: number
-): Promise<{
-  missing: {geometry_ids: number[]; match_ids: number[]};
-  matches: {geometry_ids: number[]; match_ids: number[]};
-}> => {
-  const matrix = await matchMatrix(client, tableName, source_id);
-  const geometries_id = matrix.map(m => m[1][0]);
-  const matchTable_id = matrix.map(m => m[0][0]);
-  const missingGeometryIds = await client
-    .query(
-      `SELECT id FROM "Geometries" WHERE source_id = $1 AND id NOT IN (${geometries_id.join(
-        ','
-      )})`,
-      [source_id]
-    )
-    .then(result => (result.rowCount > 0 ? result.rows : []));
-  const missingMatchIds = await client
-    .query(
-      `SELECT id FROM "${tableName}_cln" WHERE id NOT IN (${matchTable_id.join(
-        ','
-      )})`
-    )
-    .then(result => (result.rowCount > 0 ? result.rows : []));
+export const idMatrix = (matrix: Matrix): {[index: string]: number} => {
+  const map: {[index: number]: number} = {};
+  matrix.forEach(m => {
+    map[m[0][0]] = m[1][0];
+  });
+  return map;
+};
 
-  return {
-    missing: {
-      geometry_ids: missingGeometryIds,
-      match_ids: missingMatchIds,
-    },
-    matches: {
-      geometry_ids: geometries_id,
-      match_ids: matchTable_id,
-    },
-  };
+export const fidMatrix = (matrix: Matrix): {[index: string]: number} => {
+  const map: {[index: string]: number} = {};
+  matrix.forEach(m => {
+    map[m[0][1]] = m[1][1];
+  });
+  return map;
 };
 
 export const collectionFromSource = (

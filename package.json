@@ -35,11 +35,13 @@
   },
   "homepage": "https://github.com/opendatacloudservices/local-classification-spatial#readme",
   "devDependencies": {
+    "@types/express": "^4.17.13",
     "@types/node": "^14.11.2",
     "@types/node-fetch": "^2.5.12",
     "@types/node-notifier": "^8.0.1",
     "@types/pg": "^8.6.1",
     "eslint": "^7.32.0",
+    "express": "^4.17.1",
     "gts": "^3.1.0",
     "jest": "^27.0.6",
     "ts-node": "^10.2.0",
@@ -47,12 +49,15 @@
   },
   "dependencies": {
     "dotenv": "^10.0.0",
+    "fast-csv": "^4.3.6",
     "fast-xml-parser": "^3.19.0",
     "jszip": "^3.7.1",
     "local-logger": "file:../local-logger",
     "local-microservice": "file:../local-microservice",
     "node-fetch": "^2.6.1",
     "node-notifier": "^10.0.0",
-    "pg": "^8.7.1"
+    "pg": "^8.7.1",
+    "string-comparison": "^1.0.9",
+    "wink-nlp": "^1.8.1"
   }
 }

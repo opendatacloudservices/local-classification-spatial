@@ -1,5 +1,6 @@
 import {Client} from 'pg';
 import type {Columns, Download} from '../types';
+import {getMatch} from './matches';
 
 export const generateTableName = (filename: string): string => {
   const prefix = 'db_' + Date.now();
@@ -15,12 +16,22 @@ export const generateTableName = (filename: string): string => {
   return prefix + cleanName;
 };
 
-export const saveBigFile = (client: Client, id: number): Promise<void> => {
-  return client
-    .query('INSERT INTO "Matches" (import_id, message) VALUES ($1, $2)', [
-      id,
-      'big-file',
-    ])
+export const saveBigFile = (
+  client: Client,
+  odcsClient: Client,
+  id: number
+): Promise<void> => {
+  return getMatch(client, id)
+    .then(match => {
+      if (!match) {
+        return null;
+      } else {
+        return odcsClient.query(
+          'UPDATE "DownloadedFiles" SET is_big = TRUE WHERE id = $1',
+          [match.import_id]
+        );
+      }
+    })
     .then(() => {});
 };
 
@@ -43,7 +54,6 @@ const acceptedMimetype = [
   'application/vnd.google-earth.kmz',
 ];
 
-// TODO: special handling for existing previous information...
 export const getNext = (client: Client): Promise<Download | null> => {
   return client
     .query(
@@ -83,6 +93,10 @@ export const setClassified = (
     query += `, bbox = ${
       bbox.indexOf('POLYGON') > -1
         ? `ST_GeomFromText($${params.length + 1}, 4326)`
+        : bbox.indexOf('POINT') > -1
+        ? `ST_Transform(ST_Envelope(ST_Buffer(ST_Transform(ST_GeomFromText($${
+            params.length + 1
+          }, 4326), 3857), 0.1)), 4326)`
         : `ST_MakePolygon(ST_GeomFromText($${params.length + 1}, 4326))`
     }`;
     params.push(bbox);

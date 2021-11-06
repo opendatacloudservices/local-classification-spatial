@@ -4,38 +4,15 @@ import {Client} from 'pg';
 import * as notifier from 'node-notifier';
 import fetch from 'node-fetch';
 
-import {
-  getImportValues,
-  ogr,
-  createSource,
-  importValues,
-  saveMatch,
-  dropImport,
-  importMatch,
-  finishImport,
-} from './import/index';
-import {sizeLimit} from './file/index';
-import {
-  generateTableName,
-  tableExists,
-  getColumns,
-  getNext,
-  getImportQueue,
-  saveBigFile,
-  setClassified,
-  rowCount,
-} from './postgres/index';
-import {
-  cleanGeometries,
-  collectionFromSource,
-  matchGeometries,
-  hasGeom,
-} from './postgis/index';
+import {importMatch, finishImport, getMissingIds} from './import/index';
+import {getColumns, getNext, getImportQueue} from './postgres/index';
+import {matchGeometries, matchMatrix} from './postgis/index';
 import {
   list as matchesList,
   details as matchesDetails,
   geojsonClean as matchesGeojsonClean,
   getMatch,
+  removeMissingTables,
 } from './postgres/matches';
 import {
   list as collectionsList,
@@ -48,10 +25,12 @@ dotenv.config({path: path.join(__dirname, '../.env')});
 import {api, catchAll, port} from 'local-microservice';
 
 import {logError, addToken} from 'local-logger';
-import {wait} from './utils';
-import {handleXplan, isXplan} from './import/xplan';
+import {handleXplan} from './import/xplan';
 import {handleThematic, list as thematicList} from './import/thematic';
-import {getFromImportID} from './postgres/downloads';
+import {isBbox} from './import/bbox';
+import {isSimilar} from './import/similar';
+import {checkImport, processImport} from './import/pipeline';
+import {Response} from 'express';
 
 // connect to postgres (via env vars params)
 const client = new Client({
@@ -66,19 +45,19 @@ client.connect().catch((err: Error) => {
 });
 
 // opendataservices database with imports
-const odcs_client = new Client({
+const odcsClient = new Client({
   user: process.env.ODCS_PGUSER,
   host: process.env.ODCS_PGHOST,
   database: process.env.ODCS_PGDATABASE,
   password: process.env.ODCS_PGPASSWORD,
   port: parseInt(process.env.ODCS_PGPORT || '5432'),
 });
-odcs_client.connect().catch((err: Error) => {
+odcsClient.connect().catch((err: Error) => {
   logError({message: err});
 });
 
 let active = false;
-const queueLimit = 50;
+const queueLimit = 100;
 let notified = false;
 
 /**
@@ -96,167 +75,15 @@ let notified = false;
  *       200:
  *         description: success
  */
-api.get('/next', async (req, res) => {
+api.get('/next', async (_req, res) => {
   // if there are too many geometries await approval import is stopped
   const queueSize = await getImportQueue(client);
   if (queueSize < queueLimit) {
     active = true;
     // get next import from the opendataservice database
-    const next = await getNext(odcs_client);
+    const next = await getNext(odcsClient);
     if (next) {
-      const file = process.env.DOWNLOAD_LOCATION + next.file;
-
-      // files exceeding our import limit are being ignored
-      if (sizeLimit(file)) {
-        // create a temporary table and import the file through ogr
-        const tableName = generateTableName(file);
-        const exists = await tableExists(client, tableName);
-
-        if (exists) {
-          await dropImport(client, tableName);
-        }
-
-        try {
-          await ogr(file, tableName);
-          // postgres sometimes needs its time
-          await wait(2500);
-
-          // check if the table was created
-          const exists = await tableExists(client, tableName);
-          if (exists) {
-            // check if this file contains geometries
-            // quite often wfs layers do not contain geometries?!
-            if (
-              (await hasGeom(client, tableName)) &&
-              (await rowCount(client, tableName)) > 0
-            ) {
-              // clean the geometries (multi > single + fixing)
-              await cleanGeometries(client, tableName);
-              await wait(2500);
-
-              // match new geometries against existing geometries
-              const match = await matchGeometries(client, tableName);
-
-              // if there is a match, check if the geom-attributes already exist
-              if (match.source_id) {
-                // TODO: for now we save all values, as it is more or less impossible to tell if its a duplicate???
-                // TODO: save the WFS layer name somewhere (its important)
-                // const columns = await getColumns(client, tableName);
-                // const values = await getImportValues(
-                //   client,
-                //   tableName,
-                //   columns
-                // );
-
-                // check = await checkValues(
-                //   client,
-                //   values,
-                //   columns,
-                //   match.source_id,
-                //   next.downloaded,
-                //   await matchMatrix(client, tableName, match.source_id)
-                // );
-
-                // if the attributes do not exist, insert into database
-                // if (check) {
-                //    INSERT ITS NEW
-                // } else {
-                //   // This already exists in our database
-                //   await saveMatch(
-                //     client,
-                //     next.id,
-                //     next.file,
-                //     match,
-                //     'duplicate',
-                //     tableName,
-                //     match.process?.differences
-                //   );
-                // }
-
-                // TODO: identify name columns and add to names array
-                const collection_id = await collectionFromSource(
-                  client,
-                  match.source_id
-                );
-
-                const source_id = await createSource(
-                  client,
-                  odcs_client,
-                  next.downloaded,
-                  next.id,
-                  collection_id,
-                  JSON.stringify(match.process) || null,
-                  match.source_id
-                );
-
-                const columns = await getColumns(client, tableName);
-                const values = await getImportValues(
-                  client,
-                  tableName,
-                  columns
-                );
-
-                await importValues(
-                  client,
-                  tableName,
-                  values,
-                  columns,
-                  source_id,
-                  match.source_id
-                );
-
-                await setClassified(
-                  odcs_client,
-                  next.id,
-                  true,
-                  null,
-                  false,
-                  null,
-                  null,
-                  null
-                );
-                // remove temporary import table
-                await dropImport(client, tableName);
-              } else {
-                const match_id = await saveMatch(
-                  client,
-                  next.id,
-                  next.file,
-                  match,
-                  'no-match',
-                  tableName
-                );
-
-                if (await isXplan(client, odcs_client, match_id)) {
-                  await handleXplan(client, odcs_client, match_id);
-                }
-              }
-              res.status(200).json({message: 'importing, success', match});
-            } else {
-              await setClassified(odcs_client, next.id, false);
-              await dropImport(client, tableName);
-              res.status(200).json({message: 'no geom'});
-            }
-          } else {
-            console.log('weird 1');
-            await setClassified(odcs_client, next.id, false);
-            await dropImport(client, tableName);
-            res.status(200).json({message: 'weird file'});
-          }
-        } catch (err) {
-          console.log('err', err);
-          console.log(next.id, tableName);
-          await setClassified(odcs_client, next.id);
-          // for error evaluation the table in question is not dropped??
-          // await dropImport(client, tableName);
-          res.status(200).json({message: 'weird file'});
-        }
-      } else {
-        // file is too big, information gets stored in table "Matches"
-        await saveBigFile(client, next.id);
-        await setClassified(odcs_client, next.id);
-        res.status(200).json({message: 'importing, file too large'});
-      }
+      await processImport(next, client, odcsClient, <Response>res);
       fetch(addToken(`http://localhost:${port}/next`, res));
     } else {
       // Everything from the opendataservice
@@ -328,60 +155,7 @@ api.get('/recheck', async (req, res) => {
   const matches = await matchesList(client);
   res.status(200).json({message: 'recheck started', count: matches.length});
   for (let m = 0; m < matches.length; m += 1) {
-    const match = await matchGeometries(client, matches[m].table_name);
-    if (match.source_id) {
-      const collection_id = await collectionFromSource(client, match.source_id);
-      const download = await getFromImportID(odcs_client, matches[m].import_id);
-
-      const source_id = await createSource(
-        client,
-        odcs_client,
-        download.downloaded,
-        matches[m].import_id,
-        collection_id,
-        JSON.stringify(match.process) || null,
-        match.source_id
-      );
-
-      const columns = await getColumns(client, matches[m].table_name);
-      const values = await getImportValues(
-        client,
-        matches[m].table_name,
-        columns
-      );
-
-      await importValues(
-        client,
-        matches[m].table_name,
-        values,
-        columns,
-        source_id,
-        match.source_id
-      );
-
-      await setClassified(
-        odcs_client,
-        matches[m].import_id,
-        true,
-        null,
-        false,
-        null,
-        null,
-        null
-      );
-      await dropImport(client, matches[m].table_name);
-    } else {
-      await saveMatch(
-        client,
-        matches[m].import_id,
-        matches[m].file,
-        match,
-        'no-match',
-        matches[m].table_name,
-        undefined,
-        matches[m].id
-      );
-    }
+    await checkImport(matches[m], client, odcsClient);
   }
   console.log('finished recheck');
 });
@@ -418,8 +192,66 @@ api.get('/check/:id', async (req, res) => {
     });
   } else {
     const match = await getMatch(client, parseInt(req.params.id.toString()));
-    const matching = await matchGeometries(client, match.table_name);
-    res.status(400).json(matching);
+    if (match) {
+      const matching = await matchGeometries(client, match.table_name);
+      res.status(200).json(matching);
+    } else {
+      res.status(404).json({
+        message: 'Match id not found',
+      });
+    }
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /similarity/{id}:
+ *   get:
+ *     operationId: getSimilarity
+ *     description: check a specific match for similar downloads
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "import in progress" }
+ *           application/json: { "message": "import started" }
+ */
+api.get('/similarity/:id', async (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({
+      message: 'Missing parameters (id)',
+    });
+  } else {
+    const similar = await isSimilar(
+      client,
+      odcsClient,
+      parseInt(req.params.id.toString())
+    );
+    if (similar) {
+      // await handleSimilar(
+      //   client,
+      //   odcsClient,
+      //   similar,
+      //   parseInt(req.params.id.toString())
+      // );
+      res.status(200).json(similar);
+    } else {
+      res.status(404).json({
+        message: 'Match id not found',
+      });
+    }
   }
 });
 
@@ -473,18 +305,19 @@ api.get('/import/new', async (req, res) => {
       .status(400)
       .json({message: 'Missing parameters (table, name, namecolumn)'});
   } else {
-    const collectionId = await importMatch(
+    res.status(200).json({message: 'importing'});
+
+    await importMatch(
       client,
-      odcs_client,
+      odcsClient,
       parseInt(req.query.id.toString()),
       req.query.name.toString(),
       req.query.nameColumn.toString(),
       req.query.spatColumn ? req.query.spatColumn.toString() : null
     );
 
-    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
-
-    res.status(200).json({message: 'importing', collectionId});
+    await finishImport(client, odcsClient, parseInt(req.query.id.toString()));
+    console.log('finished importing');
   }
 });
 
@@ -502,12 +335,6 @@ api.get('/import/new', async (req, res) => {
  *         schema:
  *           type: integer
  *         description: id from the table Matches
- *       - in: query
- *         name: name
- *         required: true
- *         schema:
- *           type: string
- *         description: name for the new collection
  *       - in: query
  *         name: nameColumn
  *         required: true
@@ -539,30 +366,85 @@ api.get('/import/new', async (req, res) => {
  *           application/json: { "message": "importing", collectionId: 123 }
  */
 api.get('/import/add', async (req, res) => {
-  if (
-    !req.query.id ||
-    !req.query.name ||
-    !req.query.nameColumn ||
-    !req.query.collectionId
-  ) {
+  if (!req.query.id || !req.query.nameColumn || !req.query.collectionId) {
     res.status(400).json({
       message: 'Missing parameters (table, name, namecolumn, collectionId)',
     });
   } else {
-    const collectionId = await importMatch(
+    res.status(200).json({message: 'importing add'});
+
+    await importMatch(
       client,
-      odcs_client,
+      odcsClient,
       parseInt(req.query.id.toString()),
-      req.query.name.toString(),
+      '',
       req.query.nameColumn.toString(),
       req.query.spatColumn ? req.query.spatColumn.toString() : null,
       false,
-      parseInt(req.query.collectionId.toString())
+      parseInt(req.query.collectionId.toString()),
+      'add'
     );
 
-    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
+    await finishImport(client, odcsClient, parseInt(req.query.id.toString()));
 
-    res.status(200).json({message: 'importing add', collectionId});
+    console.log('import finished');
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /test/add:
+ *   get:
+ *     operationId: getTestAdd
+ *     description: Test the adding of a geometry to an existing collection (and its attributes)
+ *     parameters:
+ *       - in: query
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *       - in: query
+ *         name: collectionId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id of the collection this new geometries should be added to
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing parameters
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "importing", collectionId: 123 }
+ */
+api.get('/test/add', async (req, res) => {
+  if (!req.query.id || !req.query.collectionId) {
+    res.status(400).json({
+      message: 'Missing parameters (id, collectionId)',
+    });
+  } else {
+    const match = await getMatch(client, parseInt(req.query.id.toString()));
+    if (match) {
+      const matrix = await matchMatrix(
+        client,
+        match.table_name,
+        parseInt(req.query.collectionId.toString())
+      );
+      const missing = await getMissingIds(
+        client,
+        match.table_name,
+        matrix.map(m => m[0][0])
+      );
+      res.status(200).json({ids: missing.map(m => m.id).join(',')});
+    } else {
+      res.status(200).json({message: 'match not found'});
+    }
   }
 });
 
@@ -627,30 +509,28 @@ api.get('/import/update', async (req, res) => {
     !req.query.id ||
     !req.query.name ||
     !req.query.nameColumn ||
-    !req.query.collectionId ||
-    !req.query.previousSourceId
+    !req.query.collectionId
   ) {
     res.status(400).json({
       message:
         'Missing parameters (table, name, namecolumn, collectionId, previousSourceId)',
     });
   } else {
-    const collectionId = await importMatch(
+    res.status(200).json({message: 'importing update'});
+
+    await importMatch(
       client,
-      odcs_client,
+      odcsClient,
       parseInt(req.query.id.toString()),
       req.query.name.toString(),
       req.query.nameColumn.toString(),
       req.query.spatColumn ? req.query.spatColumn.toString() : null,
       false,
       parseInt(req.query.collectionId.toString()),
-      'add',
-      parseInt(req.query.previousSourceId.toString())
+      'new'
     );
 
-    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
-
-    res.status(200).json({message: 'importing update', collectionId});
+    await finishImport(client, odcsClient, parseInt(req.query.id.toString()));
   }
 });
 
@@ -725,7 +605,6 @@ api.get('/import/merge', async (req, res) => {
     !req.query.name ||
     !req.query.nameColumn ||
     !req.query.collectionId ||
-    !req.query.previousSourceId ||
     !req.query.method ||
     (req.query.method.toString() !== 'skip' &&
       req.query.method.toString() !== 'replace')
@@ -735,25 +614,25 @@ api.get('/import/merge', async (req, res) => {
         'Missing parameters (table, name, namecolumn, collectionId, previousSourceId, method) or invalid method parameter: skip | replace',
     });
   } else {
-    // TODO: store merge action in source
-    const collectionId = await importMatch(
+    res.status(200).json({message: 'importing update'});
+
+    await importMatch(
       client,
-      odcs_client,
+      odcsClient,
       parseInt(req.query.id.toString()),
       req.query.name.toString(),
       req.query.nameColumn.toString(),
       req.query.spatColumn ? req.query.spatColumn.toString() : null,
       false,
       parseInt(req.query.collectionId.toString()),
-      req.query.method.toString(),
-      parseInt(req.query.previousSourceId.toString())
+      req.query.method.toString()
     );
 
-    await finishImport(client, odcs_client, parseInt(req.query.id.toString()));
-
-    res.status(200).json({message: 'importing update', collectionId});
+    await finishImport(client, odcsClient, parseInt(req.query.id.toString()));
   }
 });
+
+// TODO: Before update compare the potential matches Endpoint for comparison geojson
 
 /**
  * @swagger
@@ -789,6 +668,30 @@ api.get('/collections/drop/:id', async (req, res) => {
 
     res.status(200).json({message: 'dropped', id: req.params.id});
   }
+});
+
+/**
+ * @swagger
+ *
+ * /missingtables/drop:
+ *   get:
+ *     operationId: getMissingTablesDrop
+ *     description: Drop tables without matches
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing id parameter
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "dropped" }
+ */
+api.get('/missingtables/drop', async (req, res) => {
+  await removeMissingTables(client);
+  res.status(200).json({message: 'dropped'});
 });
 
 /**
@@ -861,7 +764,7 @@ api.get('/matches/details/:id', async (req, res) => {
   if (!req.params.id) {
     res.status(400).json({message: 'Missing id parameter'});
   } else {
-    matchesDetails(odcs_client, parseInt(req.params.id)).then(result => {
+    matchesDetails(odcsClient, parseInt(req.params.id)).then(result => {
       res.status(200).json(result);
     });
   }
@@ -895,10 +798,13 @@ api.get('/matches/columns/:id', async (req, res) => {
   if (!req.params.id) {
     res.status(400).json({message: 'Missing id parameter'});
   } else {
-    // TODO: if id does not exist
     const match = await getMatch(client, parseInt(req.params.id));
-    const columns = await getColumns(client, match.table_name);
-    res.status(200).json(columns);
+    if (match) {
+      const columns = await getColumns(client, match.table_name);
+      res.status(200).json(columns);
+    } else {
+      res.status(404).json({message: 'id not found'});
+    }
   }
 });
 
@@ -964,7 +870,7 @@ api.get('/matches/setxplan/:id', async (req, res) => {
   if (!req.params.id) {
     res.status(400).json({message: 'Missing id parameter'});
   } else {
-    handleXplan(client, odcs_client, parseInt(req.params.id)).then(() => {
+    handleXplan(client, odcsClient, parseInt(req.params.id)).then(() => {
       res
         .status(200)
         .json({message: 'Classification success!', id: req.params.id});
@@ -1006,15 +912,20 @@ api.get('/matches/setthematic/:id', async (req, res) => {
     });
   } else {
     handleThematic(
-      odcs_client,
+      odcsClient,
       client,
       parseInt(req.params.id),
       req.query.thematic.toString()
-    ).then(() => {
-      res
-        .status(200)
-        .json({message: 'Classification success!', id: req.params.id});
-    });
+    )
+      .then(() => {
+        res
+          .status(200)
+          .json({message: 'Classification success!', id: req.params.id});
+      })
+      .catch(err => {
+        logError({message: err});
+        res.status(400).json({message: 'Error', id: req.params.id, err});
+      });
   }
 });
 
@@ -1034,12 +945,44 @@ api.get('/matches/setthematic/:id', async (req, res) => {
  *       200:
  *         description: success
  */
-// TODO: thematic as additional table and only IDs in downloadedFiles
 api.get('/thematic/topics', async (req, res) => {
   if (!req.query.thematic) {
-    thematicList(odcs_client).then(result => {
+    thematicList(odcsClient).then(result => {
       res.status(200).json(result);
     });
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /check-bbox/{id}:
+ *   get:
+ *     operationId: getCheck-Bbox
+ *     description: check if match is a bbox
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       400:
+ *         description: missing id parameter
+ *       200:
+ *         description: success
+ */
+api.get('/check-bbox/:id', async (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({message: 'Missing id parameter'});
+  } else {
+    const test = await isBbox(client, parseInt(req.params.id.toString()));
+    res.status(200).json({isBbox: test});
   }
 });
 

@@ -4,6 +4,7 @@ const ignoreColumns = [
   'shape_length',
   'shape_area',
   'geom',
+  'geom_3857',
   'fid',
   'gml_id',
   'objectid',

@@ -1,9 +1,9 @@
 import {Client} from 'pg';
 import {dropImport} from '.';
+import {geojson} from '../file';
 import {getGeometryType, getGeomSummary} from '../postgis';
 import {downloadCompletion, setClassified} from '../postgres';
-import {geojson, getMatch} from '../postgres/matches';
-import {saveZip} from '../utils';
+import {getMatch} from '../postgres/matches';
 
 export const list = (
   odcsClient: Client
@@ -54,6 +54,9 @@ export const handleThematic = async (
   subthematic?: string
 ): Promise<void> => {
   const match = await getMatch(client, id);
+  if (!match) {
+    throw Error('match_id not found');
+  }
   const geomType = await getGeometryType(client, match.table_name);
   const geom = await getGeomSummary(client, match.table_name);
 
@@ -75,12 +78,9 @@ export const handleThematic = async (
 
   await downloadCompletion(odcsClient, match.import_id);
 
-  const geojsonObj = await geojson(client, match.id);
-
-  await saveZip(
-    JSON.stringify(geojsonObj),
-    match.import_id + '.geojson',
-    (process.env.THEMATIC_LOCATION || '') + match.import_id + '.zip'
+  await geojson(
+    process.env.DOWNLOAD_LOCATION + match.file,
+    (process.env.THEMATIC_LOCATION || '') + match.import_id
   );
 
   // Drop temporary tables

@@ -1,18 +1,20 @@
 import {exec} from 'child_process';
 import {Client} from 'pg';
 import {
+  fidMatrix,
   getGeometryType,
   getGeomSummary,
+  idMatrix,
   matchMatrix,
-  negativeMatchMatrix,
-  toSingleGeomType,
 } from '../postgis/index';
 import {getColumns, setClassified} from '../postgres';
 import {create as createCollection} from '../postgres/collections';
 import {getFromImportID} from '../postgres/downloads';
 import {getMatch} from '../postgres/matches';
-import type {Columns, Results, Match} from '../types';
+import type {Columns, Results, Match, Matrix} from '../types';
 import {date2timestamp} from '../utils';
+import * as fastcsv from 'fast-csv';
+import {createWriteStream} from 'fs';
 
 export const ogr = (
   filename: string,
@@ -31,14 +33,14 @@ export const ogr = (
         dbname=${process.env.PGDATABASE} \
         password=${process.env.PGPASSWORD}" \
       "${filename}" \
-      -lco GEOMETRY_NAME=geom \
+      -lco GEOMETRY_NAME=geom_3857 \
       -lco FID=fid \
       -lco SPATIAL_INDEX=GIST \
       -nln ${tableName} \
-      -t_srs EPSG:4326`,
+      -t_srs EPSG:3857`,
       (err, stdout, stderr) => {
         if (err) {
-          reject(err);
+          reject({err, stdout, stderr});
         }
         resolve({
           out: stdout,
@@ -50,9 +52,12 @@ export const ogr = (
 };
 
 export const dropImportById = (client: Client, id: number): Promise<void> => {
-  return getMatch(client, id).then(match =>
-    dropImport(client, match.table_name)
-  );
+  return getMatch(client, id).then(match => {
+    if (!match) {
+      throw Error('match_id not found');
+    }
+    return dropImport(client, match.table_name);
+  });
 };
 
 export const dropImport = async (
@@ -79,19 +84,11 @@ export const getImportValues = async (
 ): Promise<Results> => {
   return client
     .query(
-      `SELECT fid, ${columns.map(c => c.name).join(', ')} FROM ${tableName}`
+      `SELECT fid, ${columns
+        .map(c => `"${c.name}"`)
+        .join(', ')} FROM ${tableName}`
     )
     .then(result => result.rows);
-};
-
-export const matrixToValuesMatrix = (
-  matrix: [number[], number[]][]
-): {[index: number]: number} => {
-  const valuesMatrixMap: {[index: number]: number} = {};
-  matrix.forEach(m => {
-    valuesMatrixMap[m[0][1]] = m[1][1];
-  });
-  return valuesMatrixMap;
 };
 
 export const checkValues = async (
@@ -100,11 +97,11 @@ export const checkValues = async (
   columns: Columns,
   source_id: number,
   updated: Date,
-  matrix: [number[], number[]][]
+  matrix: Matrix
 ): Promise<boolean> => {
   let hasNewData = true;
 
-  const valuesMatrixMap = matrixToValuesMatrix(matrix);
+  const valuesMatrixMap = fidMatrix(matrix);
 
   // check if timestamp already exists in the database
   const exists = await client
@@ -374,9 +371,7 @@ export const createSource = async (
   updated: Date,
   import_id: number | null,
   collection_id: number,
-  hausdorff?: string | null,
-  geometry_source_id?: number | null,
-  previous_source_id?: number | null
+  hausdorff?: string | null
 ): Promise<number> => {
   let insertValues: (boolean | string | number | null | Date)[] = [];
 
@@ -384,112 +379,114 @@ export const createSource = async (
     insertValues = [null, updated, true, null];
   } else {
     const importData = await odcsClient
-      .query('SELECT * FROM "Imports" WHERE id = $1', [import_id])
+      .query(
+        `SELECT "Imports".meta_license FROM "DownloadedFiles"
+        JOIN "Downloads" ON "DownloadedFiles".download_id = "Downloads".id
+        JOIN "Files" ON "Downloads".url = "Files".url
+        JOIN "Imports" ON "Files".dataset_id = "Imports".id
+        WHERE "DownloadedFiles".id = $1`,
+        [import_id]
+      )
       .then(r => r.rows[0]);
 
-    insertValues = [import_id, updated, false, importData.meta_license];
+    insertValues = [
+      import_id,
+      updated,
+      false,
+      importData && importData.meta_license
+        ? importData.meta_license
+        : 'unknown',
+    ];
   }
 
-  insertValues.push(
-    collection_id,
-    hausdorff || null,
-    geometry_source_id || null,
-    previous_source_id || null
-  );
+  insertValues.push(collection_id, hausdorff || null);
 
   return client
     .query(
-      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id, hausdorff, geometry_source_id, previous_source_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+      'INSERT INTO "Sources" (import_id, updated, manual, copyright, collection_id, hausdorff) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
       insertValues
     )
     .then(r => r.rows[0].id);
 };
 
+export const commitValues = async (
+  client: Client,
+  valueString: string,
+  inserts: (number | string | null | number[] | string[] | Date)[],
+  targetType: string
+): Promise<void> => {
+  await client.query(
+    `INSERT INTO
+    "GeometryAttributes"
+    (
+      fid,
+      source_id,
+      key,
+      ${targetType}
+    )
+    VALUES
+    ${valueString}`,
+    inserts
+  );
+};
+
+const ignoreValueNames = ['fid', 'geom', 'geom_3857', 'x_coord', 'y_coord'];
+
+// TODO: store in static CSV files
+// TODO: rethink if we want/need points
 export const importValues = async (
   client: Client,
   tableName: string,
   values: Results,
   columns: Columns,
   source_id: number,
-  geom_source_id?: number
+  collection_id: number
 ): Promise<void> => {
-  const matrix = await matchMatrix(
-    client,
-    tableName,
-    geom_source_id ? geom_source_id : source_id
-  );
-  const valuesMatrixMap = matrixToValuesMatrix(matrix);
-  for (let c = 0; c < columns.length; c += 1) {
-    if (columns[c].name !== 'fid' && columns[c].name !== 'geom') {
-      const inserts: (number | string | null | number[] | string[] | Date)[] =
-        [];
-      let valueString = '';
+  const matrix = await matchMatrix(client, tableName, collection_id);
+  const valuesMatrixMap = fidMatrix(matrix);
 
-      let valueCounter = 0;
-      values.forEach(v => {
-        if (v[columns[c].name] !== null) {
-          if (valueString !== '') {
-            valueString += ',';
-          }
-          valueString += `(
-            $${valueCounter * 4 + 1},
-            $${valueCounter * 4 + 2},
-            $${valueCounter * 4 + 3},
-            $${valueCounter * 4 + 4})`;
+  const csvStream = fastcsv.format({headers: true});
+  const csvName = (process.env.DATA_LOCATION || '') + source_id + '.csv';
+  csvStream.pipe(createWriteStream(csvName));
 
-          inserts.push(
-            valuesMatrixMap[parseInt(v.fid!.toString())],
-            source_id,
-            columns[c].name,
-            v[columns[c].name]
-          );
+  for (let vi = 0; vi < values.length; vi += 1) {
+    const v = values[vi];
+    const row: {[key: string]: string | number | null | boolean} = {
+      oFid: v.fid,
+      mFid:
+        Object.keys(matrix).length === 0
+          ? parseInt(v.fid!.toString())
+          : valuesMatrixMap[v.fid!.toString()],
+    };
 
-          valueCounter += 1;
-        }
-      });
-
-      let targetType = 'str_val';
-      switch (columns[c].type) {
-        case 'ARRAY':
-          if (columns[c].udt.indexOf('float') >= 0) {
-            targetType = 'double_a_val';
-          } else if (columns[c].udt.indexOf('int') >= 0) {
-            targetType = 'int_a_val';
-          } else if (
-            columns[c].udt.indexOf('text') >= 0 ||
-            columns[c].udt.indexOf('char') >= 0
-          ) {
-            targetType = 'str_a_val';
-          }
-          break;
-        case 'smallint':
-        case 'integer':
-          targetType = 'int_val';
-          break;
-        case 'double precision':
-          targetType = 'double_val';
-          break;
-        default:
-          targetType = 'str_val';
-          break;
-      }
-      if (valueString !== '') {
-        await client.query(
-          `INSERT INTO
-          "GeometryAttributes"
-          (
-            fid,
-            source_id,
-            key,
-            ${targetType}
-          )
-          VALUES
-          ${valueString}`,
-          inserts
-        );
+    for (let c = 0; c < columns.length; c += 1) {
+      if (!ignoreValueNames.includes(columns[c].name)) {
+        row[columns[c].name] = v[columns[c].name];
       }
     }
+
+    csvStream.write(row);
   }
+
+  csvStream.end();
+};
+
+export const saveColumns = (
+  client: Client,
+  columns: {name: string; type: string}[],
+  sourceId: number
+): Promise<void> => {
+  if (columns.length === 0) {
+    return Promise.resolve();
+  }
+  return client
+    .query(
+      `INSERT INTO "SourceColumns" (name, type, source_id) VALUES ${columns
+        .map((_c, ci) => `($${ci * 3 + 1}, $${ci * 3 + 2}, $${ci * 3 + 3})`)
+        .join(',')}`,
+      columns.map(c => [c.name, c.type, sourceId]).flat()
+    )
+    .then(() => {});
 };
 
 export const finishImport = async (
@@ -498,8 +495,13 @@ export const finishImport = async (
   id: number
 ): Promise<void> => {
   const match = await getMatch(client, id);
+  if (!match) {
+    throw Error('match_id not found');
+  }
+
   const geom = await getGeomSummary(client, match.table_name);
   const geomType = await getGeometryType(client, match.table_name);
+
   await setClassified(
     odcsClient,
     match.import_id,
@@ -558,6 +560,134 @@ export const saveMatch = (
   }
 };
 
+export const getMissingIds = (
+  client: Client,
+  tableName: string,
+  ids: number[]
+): Promise<{id: number; fid: number}[]> => {
+  return client
+    .query(
+      `SELECT id, fid FROM ${tableName}_cln${
+        ids.length > 0 ? ` WHERE id NOT IN (${ids.join(',')})` : ''
+      }`
+    )
+    .then(result =>
+      result.rows
+        ? result.rows.map(r => {
+            return {id: r.id, fid: r.fid};
+          })
+        : []
+    );
+};
+
+export const getMaxFid = (
+  client: Client,
+  tableName: string
+): Promise<number> => {
+  return client
+    .query(`SELECT MAX(fid) AS max_fid FROM ${tableName}`)
+    .then(result => result.rows[0].max_fid);
+};
+
+export const addGeometries = async (
+  client: Client,
+  tableName: string,
+  sourceId: number,
+  collectionId: number
+): Promise<null | {[index: number]: number}> => {
+  // insert geometries that do not yet exist
+  const matrix = await matchMatrix(client, tableName, collectionId);
+  const missing = await getMissingIds(
+    client,
+    tableName,
+    matrix.map(m => m[0][0])
+  );
+  const matrixFids = fidMatrix(matrix);
+  let maxFid = await getMaxFid(client, tableName);
+
+  if (missing.length > 0) {
+    const addMap: {[index: number]: number} = {};
+    const inserts: string[] = [];
+    missing.forEach(m => {
+      if (!(m.fid in matrixFids)) {
+        maxFid += 1;
+        matrixFids[m.fid] = maxFid;
+        addMap[m.fid] = maxFid;
+      } else {
+        addMap[m.fid] = matrixFids[m.fid];
+      }
+      inserts.push(
+        `((
+          SELECT geom_3857 AS geom
+          FROM ${tableName}_cln
+          WHERE
+            id = ${m.id}), ${
+          m.fid in matrixFids ? matrixFids[m.fid] : maxFid
+        }, ${sourceId})`
+      );
+    });
+    await client.query(
+      `INSERT INTO "Geometries" (geom_3857, fid, source_id) VALUES ${inserts.join(
+        ','
+      )}`
+    );
+    await client.query(
+      'UPDATE "Geometries" SET buffer = ST_Buffer(ST_MakeValid(geom_3857), 50) WHERE source_id = $1',
+      [sourceId]
+    );
+    return addMap;
+  }
+  return null;
+};
+
+export const updateGeometries = async (
+  client: Client,
+  tableName: string,
+  sourceId: number,
+  collectionId: number
+): Promise<void> => {
+  // insert geometries that do not yet exist
+  const matrix = await matchMatrix(client, tableName, collectionId, true);
+  const matrixFids = fidMatrix(matrix);
+  const matrixIds = idMatrix(matrix);
+
+  if (matrix.length > 0) {
+    const inserts: string[] = [];
+    matrix.forEach(m => {
+      inserts.push(
+        `(SELECT geom_3857 AS geom FROM ${tableName} WHERE id = ${m[0][0]}), ${
+          matrixFids[m[0][1]]
+        }, ${matrixIds[m[0][1]]}, ${sourceId}`
+      );
+    });
+    await client.query(
+      `INSERT INTO "Geometries" (geom_3857, fid, previous, source_id) VALUES (${inserts.join(
+        ','
+      )})`
+    );
+    await client.query(
+      'UPDATE "Geometries" SET buffer = ST_Buffer(ST_MakeValid(geom_3857), 50) WHERE source_id = $1',
+      [sourceId]
+    );
+  }
+};
+
+export const insertProps = (
+  client: Client,
+  propValueString: string[],
+  propValues: (string | number | null)[]
+): Promise<void> => {
+  return client
+    .query(
+      `INSERT INTO "GeometryProps" 
+        (fid, source_id, name, spat_id)
+      VALUES
+        ${propValueString.join(',')}`,
+      propValues
+    )
+    .then(() => {});
+};
+
 export const importMatch = async (
   client: Client,
   odcsClient: Client,
@@ -567,16 +697,14 @@ export const importMatch = async (
   spatColumn?: string | null,
   geomOnly = false,
   collectionId: number | null = null,
-  method = 'add', // replace, skip
-  previous?: number
+  method = 'new' // add, update
 ): Promise<number> => {
   const match = await getMatch(client, id);
+  if (!match) {
+    throw Error('match_id not found');
+  }
+
   const download = await getFromImportID(odcsClient, match.import_id);
-  const geomType = await toSingleGeomType(
-    await getGeometryType(client, match.table_name),
-    client,
-    match.table_name
-  );
 
   // create a new collection
   if (!collectionId) {
@@ -594,64 +722,119 @@ export const importMatch = async (
       matches: match.matches,
       matchesCount: match.matches_count,
       differences: match.difference,
-    }),
-    null,
-    previous || null
+    })
   );
 
-  if (method === 'add') {
+  let addedIds: {[index: number]: number} = {};
+
+  if (method === 'new') {
     // insert new geometries
     await client.query(
-      `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${match.table_name}_cln`
+      `INSERT INTO "Geometries" (geom_3857, fid, source_id) SELECT geom_3857, fid, ${source_id} FROM ${match.table_name}_cln`
     );
-  } else if (previous) {
-    const matrix = await negativeMatchMatrix(
+    await client.query(
+      'UPDATE "Geometries" SET buffer = ST_Buffer(ST_MakeValid(geom_3857), 50) WHERE source_id = $1',
+      [source_id]
+    );
+    // insert geometry properties
+    await client.query(
+      `INSERT INTO "GeometryProps" 
+        (fid, source_id, name, spat_id)
+      SELECT
+        fid,
+        ${source_id},
+        ${nameColumn},
+        ${spatColumn ? spatColumn : 'NULL'}
+      FROM
+        ${match.table_name}
+      WHERE
+        fid IN (
+          SELECT fid FROM "Geometries" WHERE source_id = ${source_id} GROUP BY fid
+        )`
+    );
+  } else if (method === 'add' && collectionId) {
+    const tAddedIds = await addGeometries(
       client,
       match.table_name,
-      previous
+      source_id,
+      collectionId
     );
-    if (method === 'replace') {
-      await client.query(
-        `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${
-          match.table_name
-        }_cln WHERE id IN ${matrix.matches.geometry_ids.join(',')}`
-      );
-    } else if (method === 'skip') {
-      await client.query(
-        `INSERT INTO "Geometries" (geom, fid, source_id) SELECT geom, fid, ${source_id} FROM ${
-          match.table_name
-        }_cln WHERE id IN ${matrix.missing.geometry_ids.join(',')}`
-      );
+    if (tAddedIds) {
+      addedIds = tAddedIds;
     }
+  } else if (method === 'update') {
+    // update existing geometries, which do not yet exist, or where dist is above threshold
+    // 1. add missing geoms
+    const tAddedIds = await addGeometries(
+      client,
+      match.table_name,
+      source_id,
+      collectionId
+    );
+    if (tAddedIds) {
+      addedIds = tAddedIds;
+    }
+
+    // 2. insert updates for existing geometries
+    await updateGeometries(client, match.table_name, source_id, collectionId);
   } else {
     throw new Error('invalid method or missing previous source_id');
   }
 
-  // insert geometry properties
-  await client.query(
-    `INSERT INTO "GeometryProps" 
-      (fid, source_id, name, centroid, area, len, spat_id)
-    SELECT
-      fid,
-      ${collectionId},
-      ${nameColumn},
-      ST_Centroid(geom),
-      ${geomType === 'POLYGON' ? 'ST_Area(geom)' : 'NULL'},
-      ${geomType === 'LINESTRING' ? 'ST_LENGTH(geom)' : 'NULL'},
-      ${spatColumn ? spatColumn : 'NULL'}
-    FROM
-      ${match.table_name}
-    WHERE
-      fid IN (
-        SELECT fid FROM "Geometries" WHERE source_id = ${source_id} GROUP BY fid
-      )`
-  );
+  if (Object.keys(addedIds).length > 0) {
+    const addedFids: number[] = [];
+    Object.keys(addedIds).forEach(key => {
+      addedFids.push(parseInt(key.toString()));
+    });
+    const metaData = await client.query(`
+      SELECT
+        fid,
+        ${source_id} AS source_id,
+        ${nameColumn} AS name,
+        ${spatColumn ? spatColumn : 'NULL'} AS spat_column
+      FROM
+        ${match.table_name}
+      WHERE fid IN (${addedFids.join(',')})
+    `);
+
+    let propValues: string[] = [];
+    let propValueString: string[] = [];
+    let propCounter = 0;
+    metaData.rows.forEach(r => {
+      propValueString.push(
+        `(${addedIds[r.fid]}, ${r.source_id}, $${2 * propCounter + 1}, $${
+          2 * propCounter + 2
+        })`
+      );
+      propCounter += 1;
+      propValues.push(r.name, r.spat_column);
+      if (propValues.length > 10000) {
+        insertProps(client, propValueString, propValues);
+        propValues = [];
+        propValueString = [];
+        propCounter = 0;
+      }
+    });
+
+    if (propValues.length > 0) {
+      insertProps(client, propValueString, propValues);
+    }
+  }
 
   if (!geomOnly) {
     const columns = await getColumns(client, match.table_name);
     const values = await getImportValues(client, match.table_name, columns);
 
-    await importValues(client, match.table_name, values, columns, source_id);
+    await importValues(
+      client,
+      match.table_name,
+      values,
+      columns,
+      source_id,
+      collectionId
+    );
+
+    await saveColumns(client, columns, source_id);
   }
 
   return collectionId;

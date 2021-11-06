@@ -1,8 +1,5 @@
 # CURRENT:
-- remove table after insert!!!!
-- recheck tables!!!!!
-- call / start / recall after table deletion
-- check if file exists > note error
+- for easy access also store collection_id/source_id on downloadedFiles
 
 # FUTURE:
 - standardize attribute keys in separate table

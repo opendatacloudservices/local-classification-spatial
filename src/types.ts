@@ -28,19 +28,26 @@ export type Download = {
 };
 
 export type Match = {
-  source_id: number | null;
+  collection_id: number | null;
   process?: {
     sources: number[];
     sourceCount: number[];
     importCount: number;
     message: string;
     differences?: {
+      collection_id: number;
       source_id: number;
       target_id: number;
+      source_fid: number;
+      target_fid: number;
+      source_diff?: number;
+      target_diff?: number;
       dist: number;
     }[];
   };
 };
+
+export type Matrix = [[number, number], [number, number], [number]][];
 
 export type GeoJson = {
   type: string;

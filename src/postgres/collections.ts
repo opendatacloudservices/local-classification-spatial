@@ -20,7 +20,9 @@ export const create = async (
   );
 
   const bbox = await client
-    .query(`SELECT ST_AsText(ST_Extent(geom)) AS bbox FROM ${tableName}`)
+    .query(
+      `SELECT ST_AsText(ST_Extent(ST_Transform(geom_3857, 4326))) AS bbox FROM ${tableName}`
+    )
     .then(result => result.rows[0].bbox);
 
   const collectionId = await client
@@ -39,16 +41,18 @@ export const drop = async (client: Client, id: number): Promise<void> => {
     .then(result => result.rows);
 
   if (sources && sources.length > 0) {
-    const tables = ['Geometries', 'GeometryProps', 'GeometryAttribues'];
+    const tables = ['Geometries', 'GeometryProps', 'GeometryAttributes'];
     await Promise.all(
       tables.map(t =>
         client.query(
-          `DELETE FROM "${t}" WHERE source_id IN (${sources.join(',')})`
+          `DELETE FROM "${t}" WHERE source_id IN (${sources
+            .map(s => s.id)
+            .join(',')})`
         )
       )
     );
     await client.query(
-      `DELETE FROM "Sources" WHERE id IN (${sources.join(',')})`
+      `DELETE FROM "Sources" WHERE id IN (${sources.map(s => s.id).join(',')})`
     );
   }
 

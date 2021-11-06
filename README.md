@@ -71,7 +71,6 @@ Geometries are always split up into their smallest units. Every such geometry un
 id: 1
 name (unique): districts > the relationships of different types is documented in CollectionRelations
 type: POLYGON
-current_geometry_source_id: 1 (for performance store which source holds the current geometry)
 
 This specific collection received two geometry imports (two version at different times):
 
@@ -80,7 +79,6 @@ id: 1
 import_id: 48902
 collection_id: 1
 geometry_source_id: NULL (If a source has geometry (and attributes)) this is NULL (see below)
-previous_id: Source.id of previous geometry (can also be derived by imported_at)
 imported_at: 2021-07-03 21:00:00
 
 The geometries imported from that specific source at that specific point in time is stored in the **Geometries** table:
@@ -89,15 +87,14 @@ The geometries imported from that specific source at that specific point in time
 fid: 1
 geom: ...
 source_id: 1
+previous_id: NULL
 
 NOTE: Geometries often come as MULTI-Geometries, this makes it extremely hard to compare geometries, e.g.: Sometimes the islands in the east and north sea are included in certain geometries, sometimes they are not included. Comparing the geometry of the affected federal states would result in a not good enough match. To overcome this. Those MULTI-Geometries are stored as SINGLE-Geometries, still connected through their shared FID. This allows us to quickly identify good geometry matches and furthermore see that a match is really good and, in case of the missing islands, a subset of the more complete version of the geometry. Downside higher storage usage, certain queries will take longer, while other perform a lot faster.
-
-For faster processing, we precalculate a couple of geometry properties, those are for each FID (not the SINGLE-Geometries).
 
 **GeometryProps**
 soruce_id: 1 (source_id, fid are a combined unique key)
 fid: 1
-area, centroid, len, name/names
+name/names
 
 Now it gets a bit complicated. For each geometry (fid) we have several Attribute sets, they can come from the same import source, we still need to store them separately, because a lot of times we will only import the attributes, because we already have the geometries stored in our system:
 

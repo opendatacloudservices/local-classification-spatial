@@ -12,7 +12,7 @@ import {dropImport} from '.';
 
 const rowLimit = 5;
 
-const terms = ['xplan', 'bebauungsplan'];
+const terms = ['xplan', 'bebauungsplan']; // TODO: observe: 'deckblattänderung', 'teiländerung'
 
 export const matchTerm = (term: string): boolean => {
   let found = false;
@@ -26,7 +26,7 @@ export const matchTerm = (term: string): boolean => {
 
 export const isXplan = async (
   client: Client,
-  odcs_client: Client,
+  odcsClient: Client,
   match_id: number
 ): Promise<boolean> => {
   const match = await client
@@ -76,7 +76,7 @@ export const isXplan = async (
   }
 
   // digging deeper, metadata from DownloadedFiles > Downloads > Files > Imports
-  const importMetadata = await odcs_client
+  const importMetadata = await odcsClient
     .query(
       `SELECT
         "DownloadedFiles".file,
@@ -125,6 +125,10 @@ export const handleXplan = async (
   match_id: number
 ): Promise<void> => {
   const match = await getMatch(client, match_id);
+  if (!match) {
+    throw Error('match_id not found');
+  }
+
   const geom = await getGeomSummary(client, match.table_name);
   const geomType = await getGeometryType(client, match.table_name);
 
@@ -140,6 +144,7 @@ export const handleXplan = async (
 
   await downloadCompletion(odcsClient, match.import_id);
 
+  // if this is too slow, use the approach used in thematic.ts
   const geojsonObj = await geojson(client, match.id);
 
   await saveZip(
