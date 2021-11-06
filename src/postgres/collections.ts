@@ -41,7 +41,7 @@ export const drop = async (client: Client, id: number): Promise<void> => {
     .then(result => result.rows);
 
   if (sources && sources.length > 0) {
-    const tables = ['Geometries', 'GeometryProps', 'GeometryAttributes'];
+    const tables = ['Geometries', 'GeometryProps', 'SourceColumns'];
     await Promise.all(
       tables.map(t =>
         client.query(

@@ -44,39 +44,6 @@ export const checkImport = async (
   if (geomMatch.collection_id) {
     const download = await getFromImportID(odcsClient, match.import_id);
 
-    // TODO: for now we save all values, as it is more or less impossible to tell if its a duplicate???
-    // const columns = await getColumns(client, tableName);
-    // const values = await getImportValues(
-    //   client,
-    //   tableName,
-    //   columns
-    // );
-
-    // check = await checkValues(
-    //   client,
-    //   values,
-    //   columns,
-    //   match.source_id,
-    //   next.downloaded,
-    //   await matchMatrix(client, tableName, match.source_id)
-    // );
-
-    // if the attributes do not exist, insert into database
-    // if (check) {
-    //    INSERT ITS NEW
-    // } else {
-    //   // This already exists in our database
-    //   await saveMatch(
-    //     client,
-    //     next.id,
-    //     next.file,
-    //     match,
-    //     'duplicate',
-    //     tableName,
-    //     match.process?.differences
-    //   );
-    // }
-
     // TODO: identify name columns and add to names array
 
     const source_id = await createSource(

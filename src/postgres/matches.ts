@@ -94,7 +94,7 @@ export const generateGeoJson = (
 const systemTables = [
   'Collections',
   'Geometries',
-  'GeometryAttributes',
+  'SourceColumns',
   'GeometryProps',
   'Matches',
   'Sources',

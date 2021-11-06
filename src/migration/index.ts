@@ -37,7 +37,6 @@ export const reset = async (
   await client.query('TRUNCATE TABLE "CollectionRelations"');
   await client.query('TRUNCATE TABLE "Collections"');
   await client.query('TRUNCATE TABLE "Geometries"');
-  await client.query('TRUNCATE TABLE "GeometryAttributes"');
   await client.query('TRUNCATE TABLE "Matches"');
   await client.query('TRUNCATE TABLE "Sources"');
   await odcsClient.query(
