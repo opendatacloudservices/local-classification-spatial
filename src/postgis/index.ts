@@ -133,7 +133,7 @@ export const cleanGeometries = async (
     id SERIAL PRIMARY KEY,
     fid INTEGER,
     geom_3857 GEOMETRY(${newGeomType}, 3857),
-    buffer GEOMETRY(${newGeomType}, 3857)
+    buffer GEOMETRY(POLYGON, 3857)
   )`);
 
   await client.query(
@@ -173,9 +173,27 @@ export const cleanGeometries = async (
     SELECT fid, ${dumpStr} FROM ${tableName}
   `);
 
-  await client.query(
-    `UPDATE ${newTableName} SET buffer = ST_Buffer(ST_MakeValid(geom_3857), 50)`
-  );
+  let doBuffer = true;
+
+  if (newGeomType === 'POLYGON') {
+    const geomCount = await client
+      .query(`SELECT COUNT(*) AS counter FROM ${newTableName}`)
+      .then(result => result.rows[0].counter);
+    if (geomCount > 50000) {
+      doBuffer = false;
+    }
+  }
+
+  if (doBuffer) {
+    await client.query(
+      // ST_MakeValid
+      `UPDATE ${newTableName} SET buffer = ST_Buffer(geom_3857, 50)`
+    );
+  } else {
+    // For large Polygon-sets we skip the buffer and use the raw geometries
+    await client.query(`UPDATE ${newTableName} SET buffer = geom_3857`);
+    console.log('no buffer for you');
+  }
 
   return newTableName;
 };
@@ -196,7 +214,7 @@ export const matchPoints = (
       "Geometries".source_id AS source,
       ${tableName}.id as source_id,
       ${tableName}.fid as source_fid,
-      ST_DistanceSpheroid("Geometries".geom_3857, ${tableName}.geom_3857) AS dist
+      ST_Distance("Geometries".geom_3857, ${tableName}.geom_3857) AS dist
     FROM "Geometries"
     ${
       open || !collection_id

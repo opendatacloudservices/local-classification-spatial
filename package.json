@@ -1,14 +1,15 @@
 {
-  "name": "local-classification-spatial",
+  "name": "@opendatacloudservices/local-classification-spatial",
   "version": "1.0.0",
   "description": "spatial classification of datasets",
   "main": "./build/index.js",
   "types": "./build/index.d.ts",
   "engines": {
-    "node": ">=10.0.0"
+    "npm": ">=8.4.1",
+    "node": ">=17.5.0"
   },
   "files": [
-    "build/src"
+    "build"
   ],
   "license": "Apache-2.0",
   "keywords": [],
@@ -34,30 +35,31 @@
     "url": "https://github.com/opendatacloudservices/local-classification-spatial/issues"
   },
   "homepage": "https://github.com/opendatacloudservices/local-classification-spatial#readme",
+  "dependencies": {
+    "@opendatacloudservices/local-logger": "^1.0.3",
+    "@opendatacloudservices/local-microservice": "^1.2.0",
+    "dotenv": "^16.0.0",
+    "fast-csv": "^4.3.6",
+    "fast-xml-parser": "^4.0.3",
+    "jszip": "^3.7.1",
+    "node-fetch": "^2.6.7",
+    "node-notifier": "^10.0.1",
+    "pg": "^8.7.3",
+    "string-comparison": "^1.1.0",
+    "wink-nlp": "^1.11.0"
+  },
   "devDependencies": {
     "@types/express": "^4.17.13",
-    "@types/node": "^14.11.2",
-    "@types/node-fetch": "^2.5.12",
-    "@types/node-notifier": "^8.0.1",
-    "@types/pg": "^8.6.1",
-    "eslint": "^7.32.0",
-    "express": "^4.17.1",
+    "@types/node": "^17.0.20",
+    "@types/node-fetch": "^2.5.10",
+    "@types/node-notifier": "^8.0.2",
+    "@types/pg": "^8.6.4",
+    "@typescript-eslint/eslint-plugin": "^5.12.1",
+    "eslint": "^8.9.0",
+    "express": "^4.17.3",
     "gts": "^3.1.0",
-    "jest": "^27.0.6",
-    "ts-node": "^10.2.0",
-    "typescript": "^4.0.3"
-  },
-  "dependencies": {
-    "dotenv": "^10.0.0",
-    "fast-csv": "^4.3.6",
-    "fast-xml-parser": "^3.19.0",
-    "jszip": "^3.7.1",
-    "local-logger": "file:../local-logger",
-    "local-microservice": "file:../local-microservice",
-    "node-fetch": "^2.6.1",
-    "node-notifier": "^10.0.0",
-    "pg": "^8.7.1",
-    "string-comparison": "^1.0.9",
-    "wink-nlp": "^1.8.1"
+    "jest": "^27.5.1",
+    "ts-node": "^10.5.0",
+    "typescript": "^4.4.4"
   }
 }

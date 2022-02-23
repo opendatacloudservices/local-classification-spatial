@@ -33,46 +33,44 @@ export const isXplan = async (
     .query('SELECT * FROM "Matches" WHERE id = $1', [match_id])
     .then(result => result.rows[0]);
 
-  const rowsCount: number = await client
-    .query(`SELECT COUNT(*) as row_count FROM ${match.table_name}`)
-    .then(result => result.rows[0].row_count);
-
-  if (rowsCount > rowLimit || rowsCount === 0) {
-    return false;
-  }
-
-  // search for indicators that this is a planning document
-  // usually either xplan or xplanung is used somewhere in various lower upper variations
-
   // the wfs layer is named xplan (something)
   if (matchTerm(match.table_name)) {
     return true;
   }
 
-  // sometimes the xplan definition is referenced in the table
+  const rowsCount: number = await client
+    .query(`SELECT COUNT(*) as row_count FROM ${match.table_name}`)
+    .then(result => result.rows[0].row_count);
+
   let foundXplan = false;
-  const metadata = await client
-    .query(`SELECT * FROM ${match.table_name}`)
-    .then(result => result.rows);
+  if (rowsCount < rowLimit && rowsCount > 0) {
+    // search for indicators that this is a planning document
+    // usually either xplan or xplanung is used somewhere in various lower upper variations
 
-  // check if the column name includes xplan
-  Object.keys(metadata[0]).forEach(k => {
-    if (matchTerm(k)) {
-      foundXplan = true;
-    }
-  });
+    // sometimes the xplan definition is referenced in the table
+    const metadata = await client
+      .query(`SELECT * FROM ${match.table_name}`)
+      .then(result => result.rows);
 
-  // check if the content contains xplan
-  metadata.forEach(m => {
-    Object.keys(m).forEach(k => {
-      if (typeof m[k] === 'string' && matchTerm(m[k])) {
+    // check if the column name includes xplan
+    Object.keys(metadata[0]).forEach(k => {
+      if (matchTerm(k)) {
         foundXplan = true;
       }
     });
-  });
 
-  if (foundXplan) {
-    return true;
+    // check if the content contains xplan
+    metadata.forEach(m => {
+      Object.keys(m).forEach(k => {
+        if (typeof m[k] === 'string' && matchTerm(m[k])) {
+          foundXplan = true;
+        }
+      });
+    });
+
+    if (foundXplan) {
+      return true;
+    }
   }
 
   // digging deeper, metadata from DownloadedFiles > Downloads > Files > Imports

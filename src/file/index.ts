@@ -1,4 +1,4 @@
-import {statSync, unlinkSync} from 'fs';
+import {statSync, unlinkSync, existsSync} from 'fs';
 import {exec} from 'child_process';
 
 // 500 MB
@@ -34,7 +34,9 @@ export const geojson = async (
             if (err) {
               reject({err, stdout, stderr});
             }
-            unlinkSync(destinationFile + '.geojson');
+            if (existsSync(destinationFile + '.geojson')) {
+              unlinkSync(destinationFile + '.geojson');
+            }
             resolve();
           }
         );

@@ -1,6 +1,6 @@
 import {DBMatch, Download} from '../types';
 import {existsSync} from 'fs';
-import {logError} from 'local-logger';
+import {logError} from '@opendatacloudservices/local-logger';
 import {
   generateTableName,
   getColumns,
@@ -10,7 +10,7 @@ import {
   tableExists,
 } from '../postgres';
 import {Client} from 'pg';
-import {Response} from 'express';
+import type {Response} from 'express';
 import {sizeLimit} from '../file';
 import {
   dropImport,
@@ -160,6 +160,8 @@ export const processImport = async (
         (await hasGeom(client, tableName)) &&
         (await rowCount(client, tableName)) > 0
       ) {
+        res.status(200).json({message: 'importing, success(ish)'});
+
         // clean the geometries (multi > single + fixing)
         await cleanGeometries(client, tableName);
         await wait(2500);
@@ -189,7 +191,6 @@ export const processImport = async (
         if (dbMatch) {
           await checkImport(dbMatch, client, odcsClient);
         }
-        res.status(200).json({message: 'importing, success'});
       } else {
         await setClassified(odcsClient, next.id, false);
         await dropImport(client, tableName);
@@ -208,7 +209,10 @@ export const processImport = async (
       err &&
       typeof err === 'object' &&
       'stderr' in err &&
-      JSON.stringify(err).indexOf('Unable to open datasource') > -1
+      (JSON.stringify(err).indexOf('Unable to open datasource') > -1 ||
+        JSON.stringify(err).indexOf(
+          'transform coordinates, source layer has no'
+        ) > -1)
     ) {
       await odcsClient.query(
         'UPDATE "DownloadedFiles" SET corrupted = TRUE WHERE id = $1',
@@ -216,8 +220,15 @@ export const processImport = async (
       );
       // Update already set files (spatial_classification = TRUE AND (no_geom IS NULL OR no_geom = FALSE) AND (is_plan = FALSE OR is_plan IS NULL) AND is_thematic IS NULL)
       await dropImport(client, tableName);
+    } else {
+      logError({
+        message: 'Unknown import error',
+        err,
+        DownloadedFilesId: next.id,
+      });
     }
-    // for error evaluation the table in question is not dropped??
-    res.status(200).json({message: 'weird file'});
+    if (!res.headersSent) {
+      res.status(200).json({message: 'weird file'});
+    }
   }
 };

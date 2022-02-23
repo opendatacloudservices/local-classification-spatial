@@ -1,8 +1,4 @@
-# CURRENT:
-- for easy access also store collection_id/source_id on downloadedFiles
-
 # FUTURE:
-- standardize attribute keys in separate table
 - derive spatial relationships
 
 # ERRORS TO CHECK

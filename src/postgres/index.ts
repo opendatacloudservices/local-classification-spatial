@@ -83,7 +83,8 @@ export const setClassified = (
 ): Promise<void> => {
   const params = [];
 
-  let query = 'UPDATE "DownloadedFiles" SET spatial_classification = TRUE';
+  let query =
+    'UPDATE "DownloadedFiles" SET spatial_classification = TRUE, classified_at = now()::timestamp';
 
   if (xplan) {
     query += ', is_plan = TRUE';
@@ -220,3 +221,10 @@ export const rowCount = (
     .query(`SELECT COUNT(*) AS row_count FROM ${tableName}`)
     .then(result => result.rows[0].row_count);
 };
+
+// TODO: VACUUM DELETED TABLES AND INDICES ???
+// export const vacuum = (client: Client): Promise<void> => {
+//   return client
+//     .query(``)
+//     .then(() => {});
+// };

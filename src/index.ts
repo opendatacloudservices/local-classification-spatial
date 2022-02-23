@@ -22,15 +22,16 @@ import {
 // get environmental variables
 dotenv.config({path: path.join(__dirname, '../.env')});
 
-import {api, catchAll, port} from 'local-microservice';
+import {api, catchAll, port} from '@opendatacloudservices/local-microservice';
 
-import {logError, addToken} from 'local-logger';
-import {handleXplan} from './import/xplan';
+import {logError, addToken} from '@opendatacloudservices/local-logger';
+import {handleXplan, isXplan} from './import/xplan';
 import {handleThematic, list as thematicList} from './import/thematic';
 import {isBbox} from './import/bbox';
 import {isSimilar} from './import/similar';
 import {checkImport, processImport} from './import/pipeline';
 import {Response} from 'express';
+import {fetchAgain} from './utils';
 
 // connect to postgres (via env vars params)
 const client = new Client({
@@ -84,7 +85,10 @@ api.get('/next', async (_req, res) => {
     const next = await getNext(odcsClient);
     if (next) {
       await processImport(next, client, odcsClient, <Response>res);
-      fetch(addToken(`http://localhost:${port}/next`, res));
+      if (!res.headersSent) {
+        res.status(200).json({message: 'import completed. starting next'});
+      }
+      await fetchAgain(`http://localhost:${port}/next`, <Response>res);
     } else {
       // Everything from the opendataservice
       active = false;
@@ -130,6 +134,33 @@ api.get('/start', async (req, res) => {
     active = true;
     fetch(addToken(`http://localhost:${port}/next`, res));
     res.status(200).json({message: 'import initiated'});
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /stop:
+ *   get:
+ *     operationId: getStop
+ *     description: stop importing
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "message": "import in progress" }
+ *           application/json: { "message": "import started" }
+ */
+api.get('/stop', async (req, res) => {
+  if (active) {
+    active = false;
+    res.status(200).json({message: 'import stopping'});
+  } else {
+    res.status(200).json({message: 'import was not active'});
   }
 });
 
@@ -252,6 +283,46 @@ api.get('/similarity/:id', async (req, res) => {
         message: 'Match id not found',
       });
     }
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /xplan/{id}:
+ *   get:
+ *     operationId: getXplan
+ *     description: check if a specific match is an xplan
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: id from the table Matches
+ *     produces:
+ *       - application/json
+ *     responses:
+ *       500:
+ *         description: error
+ *       200:
+ *         description: success
+ *         examples:
+ *           application/json: { "xplan": true }
+ *           application/json: { "xplan": false }
+ */
+api.get('/xplan/:id', async (req, res) => {
+  if (!req.params.id) {
+    res.status(400).json({
+      message: 'Missing parameters (id)',
+    });
+  } else {
+    const xplan = await isXplan(
+      client,
+      odcsClient,
+      parseInt(req.params.id.toString())
+    );
+    res.status(200).json({message: xplan});
   }
 });
 
@@ -814,7 +885,7 @@ api.get('/matches/columns/:id', async (req, res) => {
  * /matches/geojson/{id}:
  *   get:
  *     operationId: getMatchesGeojson
- *     description: Get geojson representation of a match
+ *     description: Get geojson representation of a match. Delivers a maximum of 100 geometries.
  *     parameters:
  *       - in: path
  *         name: id
@@ -836,7 +907,7 @@ api.get('/matches/geojson/:id', async (req, res) => {
   if (!req.params.id) {
     res.status(400).json({message: 'Missing id parameter'});
   } else {
-    matchesGeojsonClean(client, parseInt(req.params.id)).then(result => {
+    matchesGeojsonClean(client, parseInt(req.params.id), 100).then(result => {
       res.status(200).json(result);
     });
   }

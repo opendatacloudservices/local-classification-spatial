@@ -1,6 +1,8 @@
+import {Response} from 'express';
 import * as fs from 'fs';
 import * as jszip from 'jszip';
-import {logError} from 'local-logger';
+import {addToken, logError} from '@opendatacloudservices/local-logger';
+import fetch from 'node-fetch';
 
 export const date2timestamp = (date: Date): string => {
   return `${appendZero(date.getFullYear())}-${appendZero(
@@ -47,4 +49,31 @@ export const saveZip = (
         resolve();
       });
   });
+};
+
+// TODO: Move to local-microservice
+export const fetchAgain = async (
+  url: string,
+  res: Response,
+  pass = 0
+): Promise<void> => {
+  if (pass < 12) {
+    await wait(pass === 0 ? 0 : 1000 * 60 * 5);
+    try {
+      await fetch(addToken(url, res));
+    } catch (err) {
+      logError({
+        url,
+        pass,
+        message: 'could not complete request',
+      });
+      fetchAgain(url, res, pass + 1);
+    }
+  } else {
+    logError({
+      url,
+      message: 'could not complete request after 12 tries (60 minutes)',
+    });
+    return Promise.resolve();
+  }
 };

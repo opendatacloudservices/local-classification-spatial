@@ -40,12 +40,18 @@ export const details = (
     .then(results => results.rows);
 };
 
-export const geojsonClean = (client: Client, id: number): Promise<GeoJson> => {
+export const geojsonClean = (
+  client: Client,
+  id: number,
+  limit: number | null = null
+): Promise<GeoJson> => {
   return client
     .query('SELECT table_name FROM "Matches" WHERE id = $1', [id])
     .then(results =>
       client.query(
-        `SELECT fid, ST_AsGeoJson(ST_MakeValid(ST_CurveToLine(ST_Transform(geom_3857, 4326)))) AS geometry FROM ${results.rows[0].table_name}_cln`
+        `SELECT fid, ST_AsGeoJson(ST_MakeValid(ST_CurveToLine(ST_Transform(geom_3857, 4326)))) AS geometry FROM ${
+          results.rows[0].table_name
+        }_cln ${limit ? `LIMIT ${limit}` : ''}`
       )
     )
     .then(results => {

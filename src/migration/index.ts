@@ -1,7 +1,7 @@
 import {Client} from 'pg';
 import {dropImport, saveColumns} from '../import';
 import * as fastcsv from 'fast-csv';
-import {createWriteStream, unlinkSync} from 'fs';
+import {createWriteStream, unlinkSync, existsSync} from 'fs';
 import {exec} from 'child_process';
 
 const systemTables = [
@@ -40,7 +40,7 @@ export const reset = async (
   await client.query('TRUNCATE TABLE "Matches"');
   await client.query('TRUNCATE TABLE "Sources"');
   await odcsClient.query(
-    'UPDATE "DownloadedFiles" SET spatial_classification = NULL'
+    'UPDATE "DownloadedFiles" SET spatial_classification = NULL, classified_at = NULL'
   );
 };
 
@@ -150,7 +150,9 @@ export const exportCSV = async (client: Client): Promise<void> => {
         if (err) {
           console.log({err, stdout, stderr});
         }
-        unlinkSync(fileName + '.csv');
+        if (existsSync(fileName + '.csv')) {
+          unlinkSync(fileName + '.csv');
+        }
         resolve();
       });
     });

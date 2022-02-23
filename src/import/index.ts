@@ -11,10 +11,9 @@ import {getColumns, setClassified} from '../postgres';
 import {create as createCollection} from '../postgres/collections';
 import {getFromImportID} from '../postgres/downloads';
 import {getMatch} from '../postgres/matches';
-import type {Columns, Results, Match, Matrix} from '../types';
-import {date2timestamp} from '../utils';
+import type {Columns, Results, Match} from '../types';
 import * as fastcsv from 'fast-csv';
-import {createWriteStream} from 'fs';
+import {createWriteStream, unlinkSync, existsSync} from 'fs';
 
 export const ogr = (
   filename: string,
@@ -269,8 +268,8 @@ export const importValues = async (
   const valuesMatrixMap = fidMatrix(matrix);
 
   const csvStream = fastcsv.format({headers: true});
-  const csvName = (process.env.DATA_LOCATION || '') + source_id + '.csv';
-  csvStream.pipe(createWriteStream(csvName));
+  const fileName = (process.env.DATA_LOCATION || '') + source_id;
+  csvStream.pipe(createWriteStream(fileName + '.csv'));
 
   for (let vi = 0; vi < values.length; vi += 1) {
     const v = values[vi];
@@ -290,8 +289,18 @@ export const importValues = async (
 
     csvStream.write(row);
   }
-
   csvStream.end();
+  await new Promise<void>(resolve => {
+    exec(`zip -j ${fileName}.zip ${fileName}.csv`, (err, stdout, stderr) => {
+      if (err) {
+        console.log({err, stdout, stderr});
+      }
+      if (existsSync(fileName + '.csv')) {
+        unlinkSync(fileName + '.csv');
+      }
+      resolve();
+    });
+  });
 };
 
 export const saveColumns = (
@@ -454,6 +463,8 @@ export const addGeometries = async (
         ','
       )}`
     );
+
+    // TODO: DANGER DANGER ON LARGE IMPORTS!!!
     await client.query(
       'UPDATE "Geometries" SET buffer = ST_Buffer(ST_MakeValid(geom_3857), 50) WHERE source_id = $1',
       [sourceId]
