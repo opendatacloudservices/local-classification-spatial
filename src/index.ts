@@ -1,5 +1,8 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
+// get environmental variables
+dotenv.config({path: path.join(__dirname, '../.env')});
+
 import {Client} from 'pg';
 import * as notifier from 'node-notifier';
 import fetch from 'node-fetch';
@@ -18,9 +21,6 @@ import {
   list as collectionsList,
   drop as dropCollection,
 } from './postgres/collections';
-
-// get environmental variables
-dotenv.config({path: path.join(__dirname, '../.env')});
 
 import {api, catchAll, port} from '@opendatacloudservices/local-microservice';
 
